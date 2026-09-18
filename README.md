@@ -1,153 +1,94 @@
-# Hugging Face Model Qualification Lab V5
+# Model Verification Only — V6 fixed
 
-A lightweight Streamlit learning and qualification app that progresses organically from environment compatibility through production qualification.
+Lightweight Hugging Face model qualification app for `Qwen/Qwen2.5-0.5B-Instruct`, covering:
 
-Default model:
+0. Preflight
+1. Functional verification
+2. Phase 3 robustness / repeatability
+3. Phase 4 CPU-vs-target parity
+4. Phase 5 performance benchmark
+5. Phase 6 optimization
+6. Phase 7 regression
+7. Phase 8 production qualification
+8. Generic vs B70 reference
+9. Environment
+10. TPM checklist
+11. Summary dashboard
 
-`Qwen/Qwen2.5-0.5B-Instruct`
+## Reliability fixes in this build
 
-## Full phase sequence
+- Replaced deprecated Streamlit `use_container_width` calls with `width="stretch"`.
+- Uses Transformers v5 `dtype=` automatically; falls back to `torch_dtype=` only on Transformers v4.
+- Resets sampling-only generation settings for deterministic runs so Qwen's saved sampling config does not emit irrelevant warnings when `do_sample=False`.
+- Adds explicit CPU/CUDA/XPU memory cleanup between phase runs.
+- Phase 4 no longer holds CPU-reference and target model copies in memory simultaneously.
+- Phase 5 baseline stores model/workload/device/dtype metadata.
+- Phase 7 refuses an invalid apples-to-oranges regression comparison if baseline workload/config differs.
+- Summary readiness visualization excludes reference-only tabs from the readiness score.
+- Streamlit file watching is disabled to avoid PyTorch `torch.classes` watcher warnings.
+- Hosted Streamlit is treated as CPU-only unless PyTorch really reports an XPU.
+- Dependency ranges are constrained to compatible current families.
 
-1. **Phase 0 — Preflight**
-   - Python/package compatibility
-   - Hugging Face model/config access
-   - disk/RAM headroom
-   - CPU/CUDA/MPS/XPU visibility
-   - actual device tensor-compute smoke test
+## Dependencies
 
-2. **Phase 2 — Functional Run Verification**
-   - tokenizer/model load
-   - device placement
-   - prompt formatting/tokenization
-   - inference
-   - decode
-   - functional PASS/FAIL
-   - each internal step shows exact Python operation, actual runtime output, purpose, behind-the-scenes concept, and B60/B70 differences
+`requirements.txt`:
 
-3. **Phase 3 — Robustness / Repeatability Qualification**
-   - repeated deterministic runs
-   - prompt variation
-   - longer-context sanity
-   - pass rate / determinism / memory evidence
+```text
+streamlit>=1.57,<1.63
+transformers>=5.10,<5.18
+torch>=2.10,<2.14
+accelerate>=1.10,<2
+safetensors>=0.6,<1
+huggingface-hub>=1.0,<2
+psutil>=6,<8
+pandas>=2.2,<3
+```
 
-4. **Phase 4 — Correctness / Parity**
-   - CPU reference
-   - target backend run
-   - decoded-text comparison
-   - top-1 next-token match
-   - top-5 overlap
-   - max/mean absolute logit difference
+Transformers currently documents Python 3.10+ and PyTorch 2.5+ as supported. This package uses narrower ranges so Streamlit Cloud does not unexpectedly jump across major APIs.
 
-5. **Phase 5 — Performance Benchmark**
-   - controlled workload definition
-   - warm-up
-   - prefill latency
-   - lightweight one-token TTFT proxy
-   - end-to-end latency
-   - approximate TPOT / decode throughput
-   - generated tokens/sec
-   - run-to-run coefficient of variation
-   - accelerator memory evidence
-   - save benchmark as Phase 7 regression baseline
+## Deploy to Streamlit Community Cloud
 
-6. **Phase 6 — Optimization**
-   - baseline: `use_cache=False + torch.no_grad()`
-   - candidate: `use_cache=True + torch.inference_mode()`
-   - before/after latency
-   - throughput gain
-   - speedup
-   - deterministic output parity
-   - optimization promoted only when a measured gain exists
+Upload these files to the repository root:
 
-7. **Phase 7 — Regression**
-   - load known-good Phase 5 baseline
-   - rerun same workload
-   - latency delta
-   - throughput delta
-   - configurable regression threshold
-   - output parity guard
-   - release PASS/FAIL gate
+```text
+app.py
+requirements.txt
+self_check.py
+.streamlit/config.toml
+README.md
+```
 
-8. **Phase 8 — Production Qualification**
-   - evidence completeness
-   - upstream functional/robustness/parity gates
-   - performance SLO
-   - regression release gate
-   - resource headroom evidence
-   - reproducibility metadata
-   - scoped production go/no-go
+Set the main file to `app.py`, then reboot the app after replacing the files.
 
-## Reference and TPM tabs
+Streamlit Community Cloud will normally execute this app on CPU. Intel Arc Pro B60/B70 functional testing requires running the same package on a machine/container where that Intel GPU and its driver/runtime are actually attached.
 
-- **Generic vs B70** — generic/local step vs Intel Arc Pro step and why it differs
-- **Environment** — OS/framework/device/runtime snapshot
-- **TPM Checklist** — phase ordering and exit criteria
-- **Summary** — one consolidated TPM implementation map
-
-## Summary tab
-
-The right-most Summary tab includes a table with:
-
-- phase / reference area
-- organic implementation gist
-- current status
-- key metrics
-- most important TPM takeaway
-- top 1% interview question
-- ideal expected answer
-
-It also includes dashboard visuals for:
-
-- phase readiness
-- Phase 5 latency / throughput metrics
-- Phase 6 optimization gains
-- Phase 7 regression deltas
-- Phase 8 production readiness
-
-## Intel Arc Pro B60 / B70
-
-Both use the Intel XPU path in this learning app. The Hugging Face model/tokenizer logic remains largely the same. The practical differences are hardware capacity and compute headroom.
-
-The app annotations use these key learning distinctions:
-
-- B60: 24 GB GDDR6 class capacity
-- B70: 32 GB GDDR6 class capacity
-- B70 generally offers greater memory/compute headroom
-
-Always capture the actual device identity and software-stack versions from the tested system rather than assuming a configuration.
-
-## Run locally
+## Local run
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe self_check.py
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-## Important benchmarking note
+## Before debugging a tab
 
-This is a **lightweight TPM learning / qualification tool**, not a substitute for a production-grade benchmark harness such as a dedicated vLLM/TGI/Triton/MLPerf-style system.
+Run:
 
-The TTFT value in this app is explicitly labeled **TTFT proxy** because it measures a non-streaming one-token generation request. For rigorous serving benchmarks, instrument the real serving stack and measure the first streamed token at the client/request boundary.
-
-## Qualification mental model
-
-```text
-Preflight compatibility
-        ↓
-Single-run functional verification
-        ↓
-Repeatability / robustness qualification
-        ↓
-CPU-vs-target parity
-        ↓
-Performance benchmark baseline
-        ↓
-Controlled optimization
-        ↓
-Regression gate
-        ↓
-Production qualification
-        ↓
-Scale-out / serving / long-term operations
+```powershell
+python self_check.py
 ```
+
+It verifies imports, minimum versions, app syntax, required phase functions, and checks that deprecated Streamlit width calls are absent. It does not download the model.
+
+## Important Phase 7 rule
+
+A regression baseline is valid only if the candidate uses the same:
+
+- model ID
+- prompt/workload
+- `max_new_tokens`
+- target device
+- dtype selection
+
+If any of these differ, V6 rejects the regression comparison instead of reporting a misleading delta.

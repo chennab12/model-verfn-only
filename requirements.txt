@@ -1,9 +1,8 @@
-streamlit>=1.40,<2.0
-transformers>=4.48,<5
-torch>=2.5
-accelerate>=1.0
-safetensors>=0.4
-huggingface-hub>=0.26
-psutil>=5.9
-
-pandas>=2.0
+streamlit>=1.57,<1.63
+transformers>=5.10,<5.18
+torch>=2.10,<2.14
+accelerate>=1.10,<2
+safetensors>=0.6,<1
+huggingface-hub>=1.0,<2
+psutil>=6,<8
+pandas>=2.2,<3

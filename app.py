@@ -9,6 +9,8 @@ import traceback
 import tempfile
 import platform
 import importlib.util
+import gc
+import copy
 from pathlib import Path
 
 import streamlit as st
@@ -22,6 +24,11 @@ st.set_page_config(
 )
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Reduce non-actionable library noise in hosted deployments.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 # -----------------------------
 # Generic helpers
@@ -73,6 +80,55 @@ def selected_dtype(device, choice):
         return torch.bfloat16
     return torch.float32 if device == "cpu" else torch.float16
 
+
+def model_load_kwargs(dtype, trust_remote_code=False):
+    """Return warning-free Transformers kwargs across v4/v5."""
+    import transformers
+    kwargs = {
+        "trust_remote_code": trust_remote_code,
+        "low_cpu_mem_usage": True,
+    }
+    if version_tuple(transformers.__version__) >= (5, 0, 0):
+        kwargs["dtype"] = dtype
+    else:
+        kwargs["torch_dtype"] = dtype
+    return kwargs
+
+
+def load_causal_model(model_id, dtype, trust_remote_code=False):
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        **model_load_kwargs(dtype, trust_remote_code),
+    )
+    model.eval()
+    return model
+
+
+def deterministic_generate(model, **kwargs):
+    """Generate deterministically without inheriting sampling warnings from model generation_config."""
+    cfg = copy.deepcopy(model.generation_config)
+    cfg.do_sample = False
+    for attr in ("temperature", "top_p", "top_k", "typical_p", "min_p"):
+        if hasattr(cfg, attr):
+            setattr(cfg, attr, None)
+    kwargs.pop("do_sample", None)
+    return model.generate(generation_config=cfg, **kwargs)
+
+
+def cleanup_accelerator(device=None):
+    """Best-effort cleanup to keep repeated Streamlit runs from retaining memory."""
+    gc.collect()
+    try:
+        import torch
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif device == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+            if hasattr(torch.xpu, "empty_cache"):
+                torch.xpu.empty_cache()
+    except Exception:
+        pass
+
 def add_check(checks, name, status, detail, severity="HARD"):
     checks.append({
         "Check": name,
@@ -111,7 +167,12 @@ def render_step_expanders(result, output_label="Final generated output", metrics
     final_status = "PASS"
     if result.get("steps"):
         final_status = result["steps"][-1]["status"]
-    st.success("✅ PASS") if final_status == "PASS" else st.error("❌ FAIL")
+    if final_status == "PASS":
+        st.success("✅ PASS")
+    elif final_status == "WARN":
+        st.warning("⚠️ WARN — review the evidence below")
+    else:
+        st.error("❌ FAIL")
     if metrics:
         cols = st.columns(len(metrics))
         for col, (label, value) in zip(cols, metrics.items()):
@@ -145,7 +206,7 @@ def render_step_expanders(result, output_label="Final generated output", metrics
                 {"Target": "Intel Arc Pro B70", "What changes": step["b70"]},
                 {"Target": "Why the difference", "What changes": step["why_diff"]},
             ]
-            st.dataframe(compare_rows, use_container_width=True, hide_index=True)
+            st.dataframe(compare_rows, width="stretch", hide_index=True)
 
     if result.get("output"):
         st.subheader(output_label)
@@ -441,10 +502,7 @@ def run_verification(model_id, prompt, max_new_tokens, prefer_device, dtype_choi
                  "Tokenization is largely hardware-independent.")
 
         t1 = time.perf_counter()
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=dtype, trust_remote_code=trust_remote_code, low_cpu_mem_usage=True
-        )
-        model.eval()
+        model = load_causal_model(model_id, dtype, trust_remote_code)
         load_elapsed = time.perf_counter() - t1
         param_count = sum(p.numel() for p in model.parameters())
         add_step(5, "Load model configuration + weights", "PASS",
@@ -507,7 +565,7 @@ def run_verification(model_id, prompt, max_new_tokens, prefer_device, dtype_choi
 
         t3 = time.perf_counter()
         with torch.no_grad():
-            out = model.generate(
+            out = deterministic_generate(model, 
                 **inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id
             )
         if device == "cuda":
@@ -565,11 +623,14 @@ def run_verification(model_id, prompt, max_new_tokens, prefer_device, dtype_choi
                  "Functional qualification",
                  "B60 PASS requires the same gates on B60/XPU.", "B70 PASS requires the same gates on B70/XPU.",
                  "A model can pass here and still fail later in stability/parity/performance work.")
+        del model, tokenizer, inputs
+        cleanup_accelerator(device)
         return result
 
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
+        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
         result["steps"].append({
             "number": len(result["steps"]) + 1,
             "name": "Failure captured",
@@ -631,10 +692,7 @@ def run_phase3_qualification(model_id, base_prompt, max_new_tokens, prefer_devic
                  "Same logic; different hardware headroom can change where failures appear.")
 
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=dtype, trust_remote_code=trust_remote_code, low_cpu_mem_usage=True
-        )
-        model.eval()
+        model = load_causal_model(model_id, dtype, trust_remote_code)
         model.to(device)
         add_step(3, "Load tokenizer + model once for qualification", "PASS",
                  "tokenizer = AutoTokenizer.from_pretrained(...)\nmodel = AutoModelForCausalLM.from_pretrained(...)\nmodel.to(device)",
@@ -673,7 +731,7 @@ def run_phase3_qualification(model_id, base_prompt, max_new_tokens, prefer_devic
             inputs = {k: v.to(device) for k, v in inputs.items()}
             t0 = time.perf_counter()
             with torch.no_grad():
-                out = model.generate(
+                out = deterministic_generate(model, 
                     **inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id
                 )
             if device == "cuda":
@@ -710,7 +768,7 @@ def run_phase3_qualification(model_id, base_prompt, max_new_tokens, prefer_devic
             tok_len = int(inputs["input_ids"].shape[-1])
             inputs = {k: v.to(device) for k, v in inputs.items()}
             with torch.no_grad():
-                out = model.generate(
+                out = deterministic_generate(model, 
                     **inputs, max_new_tokens=min(max_new_tokens, 16), do_sample=False, pad_token_id=tokenizer.eos_token_id
                 )
             new_tokens = out[0][inputs["input_ids"].shape[-1]:]
@@ -776,11 +834,14 @@ def run_phase3_qualification(model_id, base_prompt, max_new_tokens, prefer_devic
                  "B60 PASS means the workload is stable on B60, not merely on CPU.",
                  "B70 PASS means the workload is stable on B70, not merely on CPU.",
                  "A model can function once yet still fail qualification when prompts vary or repetition exposes instability.")
+        del model, tokenizer
+        cleanup_accelerator(device)
         return result
 
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
+        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
         result["steps"].append({
             "number": len(result["steps"]) + 1,
             "name": "Failure captured",
@@ -867,19 +928,18 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
                  "Any input mismatch would invalidate the parity check.")
 
         # CPU reference path
-        cpu_model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.float32, trust_remote_code=trust_remote_code, low_cpu_mem_usage=True
-        )
-        cpu_model.eval().to("cpu")
+        cpu_model = load_causal_model(model_id, torch.float32, trust_remote_code).to("cpu")
         with torch.no_grad():
             cpu_logits = cpu_model(**cpu_inputs).logits[0, -1, :].float().cpu()
-            cpu_gen = cpu_model.generate(
+            cpu_gen = deterministic_generate(cpu_model, 
                 **cpu_inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id
             )
         cpu_new = cpu_gen[0][input_len:]
         cpu_text = tokenizer.decode(cpu_new, skip_special_tokens=True).strip()
         cpu_top5 = torch.topk(cpu_logits, k=5)
         cpu_top5_ids = cpu_top5.indices.tolist()
+        # Keep only CPU evidence; do not retain the full CPU model while loading target model.
+        cpu_logits_ref = cpu_logits.clone()
         result["samples"].append(f"CPU output: {cpu_text}")
         add_step(5, "Run CPU reference inference", "PASS",
                  "cpu_model = AutoModelForCausalLM.from_pretrained(...).to('cpu')\nlogits = cpu_model(**cpu_inputs).logits\ncpu_model.generate(...)",
@@ -890,15 +950,16 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
                  "B60 will be compared against this CPU reference.", "B70 will be compared against this CPU reference.",
                  "CPU is a common baseline because it is widely available and often easier to trust/debug.")
 
+        # Release the CPU model before loading a second copy. This prevents Streamlit Cloud RAM spikes.
+        del cpu_model, cpu_gen
+        cleanup_accelerator("cpu")
+
         # Target path
-        target_model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=target_dtype, trust_remote_code=trust_remote_code, low_cpu_mem_usage=True
-        )
-        target_model.eval().to(target_device)
+        target_model = load_causal_model(model_id, target_dtype, trust_remote_code).to(target_device)
         tgt_inputs = {k: v.to(target_device) for k, v in cpu_inputs.items()}
         with torch.no_grad():
             tgt_logits = target_model(**tgt_inputs).logits[0, -1, :].float().cpu()
-            tgt_gen = target_model.generate(
+            tgt_gen = deterministic_generate(target_model, 
                 **tgt_inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id
             )
         if target_device == "cuda":
@@ -924,8 +985,8 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
         same_text_norm = normalize_text(cpu_text) == normalize_text(tgt_text)
         top1_match = int(cpu_top5_ids[0] == tgt_top5_ids[0])
         top5_overlap = len(set(cpu_top5_ids).intersection(set(tgt_top5_ids)))
-        max_abs_diff = float((cpu_logits - tgt_logits).abs().max().item())
-        mean_abs_diff = float((cpu_logits - tgt_logits).abs().mean().item())
+        max_abs_diff = float((cpu_logits_ref - tgt_logits).abs().max().item())
+        mean_abs_diff = float((cpu_logits_ref - tgt_logits).abs().mean().item())
 
         result["summary"] = {
             "same_text_exact": same_text_exact,
@@ -963,11 +1024,14 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
                  "B60 PASS means B60 behavior is acceptably close to CPU for this test.",
                  "B70 PASS means B70 behavior is acceptably close to CPU for this test.",
                  "A backend may be functional but still suspicious if parity metrics diverge too far from CPU.")
+        del target_model, tokenizer, tgt_inputs
+        cleanup_accelerator(target_device)
         return result
 
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
+        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
         result["steps"].append({
             "number": len(result["steps"]) + 1,
             "name": "Failure captured",
@@ -995,10 +1059,7 @@ def quick_benchmark(model_id, prompt, max_new_tokens, prefer_device, dtype_choic
     device = resolve_device(prefer_device)
     dtype = selected_dtype(device, dtype_choice)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=dtype, trust_remote_code=trust_remote_code, low_cpu_mem_usage=True
-    )
-    model.eval().to(device)
+    model = load_causal_model(model_id, dtype, trust_remote_code).to(device)
     messages=[{"role":"user","content":prompt}]
     if hasattr(tokenizer,"apply_chat_template") and getattr(tokenizer,"chat_template",None):
         formatted=tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
@@ -1015,7 +1076,7 @@ def quick_benchmark(model_id, prompt, max_new_tokens, prefer_device, dtype_choic
     # warm-up
     ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
     with ctx:
-        _=model.generate(**inputs,max_new_tokens=min(4,max_new_tokens),do_sample=False,
+        _=deterministic_generate(model, **inputs,max_new_tokens=min(4,max_new_tokens),do_sample=False,
                          use_cache=use_cache,pad_token_id=tokenizer.eos_token_id)
     sync()
 
@@ -1028,17 +1089,16 @@ def quick_benchmark(model_id, prompt, max_new_tokens, prefer_device, dtype_choic
         sync(); prefill.append(time.perf_counter()-t0)
 
         ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
-        ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
         sync(); tf=time.perf_counter()
         with ctx:
-            _first=model.generate(**inputs,max_new_tokens=1,do_sample=False,
+            _first=deterministic_generate(model, **inputs,max_new_tokens=1,do_sample=False,
                                   use_cache=use_cache,pad_token_id=tokenizer.eos_token_id)
         sync(); first_token.append(time.perf_counter()-tf)
 
         ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
         sync(); t1=time.perf_counter()
         with ctx:
-            out=model.generate(**inputs,max_new_tokens=max_new_tokens,do_sample=False,
+            out=deterministic_generate(model, **inputs,max_new_tokens=max_new_tokens,do_sample=False,
                                use_cache=use_cache,pad_token_id=tokenizer.eos_token_id)
         sync(); elapsed=time.perf_counter()-t1; gen.append(elapsed)
         new=out[0][input_tokens:]
@@ -1056,14 +1116,19 @@ def quick_benchmark(model_id, prompt, max_new_tokens, prefer_device, dtype_choic
     mean=avg_gen
     variance=sum((x-mean)**2 for x in gen)/len(gen) if gen else 0.0
     cv=(variance**0.5/mean*100) if mean else 0.0
-    return {
+    metrics = {
         "device":device,"dtype":str(dtype).replace("torch.",""),"iterations":iterations,
         "input_tokens":input_tokens,"avg_output_tokens":avg_out,"prefill_ms":avg_prefill*1000,
         "ttft_proxy_ms":avg_first*1000,"approx_tpot_ms":approx_tpot_ms,
         "e2e_ms":avg_gen*1000,"tokens_per_s":tok_s,"approx_decode_tokens_per_s":approx_decode_tok_s,
         "latency_cv_pct":cv,"memory":sample_memory_report(device),"output":texts[-1] if texts else "",
         "all_outputs":texts,"use_cache":use_cache,"inference_mode":use_inference_mode,
+        "model_id":model_id,"prompt":prompt,"max_new_tokens":max_new_tokens,
+        "requested_device":prefer_device,"dtype_choice":dtype_choice,
     }
+    del model, tokenizer, inputs, host_inputs
+    cleanup_accelerator(device)
+    return metrics
 
 # -----------------------------
 # Phase 5: performance benchmark
@@ -1089,6 +1154,11 @@ def run_phase5_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choi
             "B60 may have different first-run overhead than steady state.","B70 may have different first-run overhead than steady state.",
             "Warm-up reduces one-time runtime noise on either device.")
         bm=quick_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code,iterations,True,True)
+        bm["baseline_signature"] = {
+            "model_id": model_id, "prompt": prompt, "max_new_tokens": max_new_tokens,
+            "device": resolve_device(prefer_device), "requested_device": prefer_device,
+            "dtype_choice": dtype_choice,
+        }
         result["summary"]=bm; result["output"]=bm["output"]
         add(3,"Measure prefill latency","PASS","model(**inputs, use_cache=True)",
             f"avg_prefill={bm['prefill_ms']:.2f} ms; input_tokens={bm['input_tokens']}",
@@ -1137,6 +1207,7 @@ def run_phase5_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choi
         return result
     except Exception as e:
         result["error"]=f"{type(e).__name__}: {e}"; result["traceback"]=traceback.format_exc()
+        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
         add(len(result["steps"])+1,"Failure captured","FAIL","exception handler",result["error"],
             "Capture exact benchmark failure evidence.","This helps distinguish setup, memory, runtime and measurement failures.",
             "Benchmark failure isolation","Classify B60-specific failures.","Classify B70-specific failures.","Same debugging method; capacity may change failure mode.")
@@ -1207,6 +1278,7 @@ def run_phase6_optimization(model_id,prompt,max_new_tokens,prefer_device,dtype_c
         return result
     except Exception as e:
         result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc()
+        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
         add(len(result['steps'])+1,"Failure captured","FAIL","exception handler",result['error'],
             "Capture optimization failure evidence.","This shows whether the baseline or optimized path caused the issue.",
             "Optimization debugging","Classify B60 tuning failure.","Classify B70 tuning failure.","Same method; memory/capacity can alter results.")
@@ -1223,6 +1295,15 @@ def run_phase7_regression(model_id,prompt,max_new_tokens,prefer_device,dtype_cho
     try:
         if not baseline:
             raise ValueError("No regression baseline is available. Run Phase 5 and save it as the baseline first.")
+        signature = baseline.get("baseline_signature", {})
+        current_signature = {
+            "model_id": model_id, "prompt": prompt, "max_new_tokens": max_new_tokens,
+            "device": resolve_device(prefer_device), "requested_device": prefer_device,
+            "dtype_choice": dtype_choice,
+        }
+        mismatches = [k for k in current_signature if signature and signature.get(k) != current_signature.get(k)]
+        if mismatches:
+            raise ValueError("Regression workload/config does not match saved baseline: " + ", ".join(mismatches))
         add(1,"Load known-good baseline","PASS","baseline = saved_phase5_metrics",
             f"baseline_e2e={baseline['e2e_ms']:.2f} ms; baseline_tok/s={baseline['tokens_per_s']:.2f}; threshold={threshold_pct:.1f}%",
             "Anchor regression decisions to a previously accepted measurement.",
@@ -1278,6 +1359,7 @@ def run_phase7_regression(model_id,prompt,max_new_tokens,prefer_device,dtype_cho
         return result
     except Exception as e:
         result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc()
+        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
         add(len(result['steps'])+1,"Failure captured","FAIL","exception handler",result['error'],
             "Capture regression-pipeline failure evidence.","A missing baseline or failed candidate run is itself a release-process problem.",
             "Regression pipeline reliability","Fix B60 baseline/pipeline evidence.","Fix B70 baseline/pipeline evidence.","Release gates need reproducible baselines.")
@@ -1345,6 +1427,7 @@ def run_phase8_production_qualification(evidence, max_e2e_ms=5000.0, min_tok_s=1
         return result
     except Exception as e:
         result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc()
+        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
         add(len(result['steps'])+1,"Failure captured","FAIL","exception handler",result['error'],
             "Capture production-qualification pipeline failure.","Missing evidence or aggregation failures must block release until resolved.",
             "Production gate reliability","Block B60 promotion.","Block B70 promotion.","A broken release gate is itself a production risk.")
@@ -1364,7 +1447,7 @@ COMPARISON = [
 st.title("✅ Hugging Face Model Functional Verifier")
 st.write(
     "A lightweight functional checker with a **preflight gate**, a transparent **single-run functional tab**, "
-    "and now two new tabs for **Phase 3 robustness qualification** and **Phase 4 CPU-vs-target parity**."
+    "covering the complete lightweight path from preflight through production qualification, with safer memory handling for Streamlit Cloud."
 )
 
 with st.sidebar:
@@ -1374,7 +1457,13 @@ with st.sidebar:
     dtype_choice = st.selectbox("Dtype", ["Auto", "FP32", "FP16", "BF16"])
     max_new_tokens = st.slider("Max new tokens", 8, 128, 32, 8)
     trust_remote_code = st.toggle("Trust remote code", value=False)
-    st.caption("For Intel Arc Pro B60/B70 qualification, choose XPU explicitly when you want to qualify that hardware.")
+    st.caption("For Intel Arc Pro B60/B70 qualification, choose XPU explicitly when the app is running on a machine with that Intel GPU attached.")
+    try:
+        import torch
+        if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+            st.caption("Hosted Streamlit environments commonly expose CPU only; B60/B70 verification requires a B60/B70 host.")
+    except Exception:
+        pass
 
 tabs = st.tabs([
     "0 · Preflight",
@@ -1394,13 +1483,13 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Setup compatibility preflight")
     st.write("Run this first. **HARD FAIL** blocks later phases; **WARN** means the setup may still work but deserves attention.")
-    if st.button("🔎 Run preflight", type="primary", use_container_width=True):
+    if st.button("🔎 Run preflight", type="primary", width="stretch"):
         with st.spinner("Checking setup compatibility..."):
             st.session_state["preflight"] = run_preflight(model_id.strip(), device, dtype_choice, trust_remote_code)
     pf = st.session_state.get("preflight")
     if pf:
         st.success("✅ PREFLIGHT READY — no hard compatibility blockers detected.") if pf["ready"] else st.error("❌ PREFLIGHT BLOCKED — fix HARD FAIL items before later phases.")
-        st.dataframe(pf["checks"], use_container_width=True, hide_index=True)
+        st.dataframe(pf["checks"], width="stretch", hide_index=True)
         hard_fails=[c for c in pf["checks"] if c["Severity"]=="HARD" and c["Status"]=="FAIL"]
         warnings=[c for c in pf["checks"] if c["Status"]=="WARN"]
         a,b,c=st.columns(3);a.metric("Hard failures",len(hard_fails));b.metric("Warnings",len(warnings));c.metric("Selected device",pf["info"].get("device") or "—")
@@ -1415,7 +1504,7 @@ with tabs[1]:
     elif not ready: st.error("Functional verification is blocked because preflight has a HARD FAIL.")
     prompt=st.text_area("Prompt",value="Reply with one short sentence explaining what a GPU does.",height=90,key="phase2_prompt")
     st.caption("Single-run functionality only. This does not yet prove stability, parity, or performance.")
-    if st.button("▶ Run functional verification",use_container_width=True,disabled=not ready):
+    if st.button("▶ Run functional verification",width="stretch",disabled=not ready):
         with st.spinner("Loading and running model..."):
             st.session_state["phase2_result"]=run_verification(model_id.strip(),prompt.strip(),max_new_tokens,device,dtype_choice,trust_remote_code)
     result=st.session_state.get("phase2_result")
@@ -1433,7 +1522,7 @@ with tabs[2]:
     c1,c2=st.columns(2)
     with c1: repeats=st.slider("Repeat count",2,5,3,1)
     with c2: long_repeat_factor=st.slider("Long-context factor",20,120,60,10)
-    if st.button("▶ Run Phase 3 qualification",use_container_width=True,disabled=not ready):
+    if st.button("▶ Run Phase 3 qualification",width="stretch",disabled=not ready):
         with st.spinner("Running repeatability and stability checks..."):
             st.session_state["phase3_result"]=run_phase3_qualification(model_id.strip(),q_prompt.strip(),max_new_tokens,device,dtype_choice,trust_remote_code,repeats,long_repeat_factor)
     result=st.session_state.get("phase3_result")
@@ -1445,7 +1534,7 @@ with tabs[3]:
     st.subheader("Phase 4 — correctness / parity against CPU reference")
     pf=st.session_state.get("preflight");ready=bool(pf and pf.get("ready"))
     p_prompt=st.text_area("Prompt for parity comparison",value="In one short sentence, explain what tokenization does in an LLM.",height=90,key="phase4_prompt")
-    if st.button("▶ Run Phase 4 parity",use_container_width=True,disabled=not ready):
+    if st.button("▶ Run Phase 4 parity",width="stretch",disabled=not ready):
         with st.spinner("Running CPU-vs-target parity check..."):
             st.session_state["phase4_result"]=run_phase4_parity(model_id.strip(),p_prompt.strip(),max_new_tokens,device,dtype_choice,trust_remote_code)
     result=st.session_state.get("phase4_result")
@@ -1459,7 +1548,7 @@ with tabs[4]:
     b_prompt=st.text_area("Benchmark prompt",value="Explain in two short sentences why KV cache matters during LLM inference.",height=90,key="phase5_prompt")
     iterations=st.slider("Measured iterations",2,5,3,1,key="phase5_iters")
     st.caption("Measures prefill latency, end-to-end latency, tokens/sec, approximate decode throughput, variability, and resource evidence.")
-    if st.button("▶ Run Phase 5 benchmark",use_container_width=True,disabled=not ready):
+    if st.button("▶ Run Phase 5 benchmark",width="stretch",disabled=not ready):
         with st.spinner("Running benchmark..."):
             st.session_state["phase5_result"]=run_phase5_benchmark(model_id.strip(),b_prompt.strip(),max_new_tokens,device,dtype_choice,trust_remote_code,iterations)
     result=st.session_state.get("phase5_result")
@@ -1478,7 +1567,7 @@ with tabs[5]:
     o_prompt=st.text_area("Optimization comparison prompt",value="Explain in one short sentence what a KV cache stores.",height=90,key="phase6_prompt")
     opt_iters=st.slider("Iterations per baseline/candidate",1,3,2,1,key="phase6_iters")
     st.caption("Compares a simple baseline against `use_cache=True + torch.inference_mode()` while holding workload constant.")
-    if st.button("▶ Run Phase 6 optimization",use_container_width=True,disabled=not ready):
+    if st.button("▶ Run Phase 6 optimization",width="stretch",disabled=not ready):
         with st.spinner("Running baseline and optimized configurations..."):
             st.session_state["phase6_result"]=run_phase6_optimization(model_id.strip(),o_prompt.strip(),max_new_tokens,device,dtype_choice,trust_remote_code,opt_iters)
     result=st.session_state.get("phase6_result")
@@ -1500,7 +1589,7 @@ with tabs[6]:
             st.warning("Run Phase 5 first and save its result as the regression baseline.")
     r_prompt=st.text_area("Regression workload prompt",value="Explain in two short sentences why KV cache matters during LLM inference.",height=90,key="phase7_prompt")
     threshold=st.slider("Allowed regression threshold (%)",1.0,30.0,10.0,1.0)
-    if st.button("▶ Run Phase 7 regression",use_container_width=True,disabled=not (ready and baseline)):
+    if st.button("▶ Run Phase 7 regression",width="stretch",disabled=not (ready and baseline)):
         with st.spinner("Comparing current candidate against baseline..."):
             st.session_state["phase7_result"]=run_phase7_regression(model_id.strip(),r_prompt.strip(),max_new_tokens,device,dtype_choice,baseline,trust_remote_code,threshold)
     result=st.session_state.get("phase7_result")
@@ -1519,7 +1608,7 @@ with tabs[7]:
               "phase5":st.session_state.get("phase5_result"),"phase6":st.session_state.get("phase6_result"),
               "phase7":st.session_state.get("phase7_result")}
     st.caption("Aggregates the entire evidence chain into a scoped go/no-go decision for this model + stack + hardware + workload.")
-    if st.button("▶ Run Phase 8 production qualification",use_container_width=True):
+    if st.button("▶ Run Phase 8 production qualification",width="stretch"):
         st.session_state["phase8_result"]=run_phase8_production_qualification(evidence,max_e2e,min_tok)
     result=st.session_state.get("phase8_result")
     if result:
@@ -1530,12 +1619,12 @@ with tabs[7]:
 
 with tabs[8]:
     st.subheader("Generic vs Intel Arc Pro B70")
-    st.dataframe(COMPARISON,use_container_width=True,hide_index=True)
+    st.dataframe(COMPARISON,width="stretch",hide_index=True)
 
 with tabs[9]:
     st.subheader("Current runtime")
     snap=runtime_snapshot()
-    st.dataframe([{"Item":k,"Value":v} for k,v in snap.items()],use_container_width=True,hide_index=True)
+    st.dataframe([{"Item":k,"Value":v} for k,v in snap.items()],width="stretch",hide_index=True)
 
 with tabs[10]:
     st.subheader("Minimal TPM progression gate")
@@ -1580,12 +1669,13 @@ with tabs[11]:
         {"Phase":"Environment","Implementation gist":"Capture OS, Python, framework versions, device visibility and accelerator identity.","Status":"PASS" if pf else "NOT RUN","Key metrics":"Python/torch/transformers versions; XPU/CUDA/MPS visibility; device name","TPM takeaway":"Environment metadata is part of reproducibility, not administrative trivia.","Top 1% interview question":"Why must benchmark reports include software-stack versions?","Ideal expected answer":"Driver/framework/runtime changes can materially alter correctness and performance, so results without version context are not reproducible."},
         {"Phase":"TPM Checklist","Implementation gist":"Keep phase gates in the correct order from compatibility to production readiness.","Status":"REFERENCE","Key metrics":"Gate completion and exit criteria per phase","TPM takeaway":"Do not optimize or benchmark before proving the prior gate; each phase answers a different customer question.","Top 1% interview question":"What is the correct order for qualifying a new model on a new accelerator?","Ideal expected answer":"Preflight → functional → robustness → parity → benchmark → optimize → regression → production qualification."},
     ]
-    st.dataframe(rows,use_container_width=True,hide_index=True)
+    st.dataframe(rows,width="stretch",hide_index=True)
 
     st.markdown("### Readiness dashboard")
-    phase_names=[r["Phase"] for r in rows]
+    readiness_rows=[r for r in rows if r["Phase"].startswith(("0 ·","2 ·","3 ·","4 ·","5 ·","6 ·","7 ·","8 ·"))]
+    phase_names=[r["Phase"] for r in readiness_rows]
     score_map={"PASS":100,"WARN":60,"FAIL":0,"NOT RUN":0}
-    scores=[score_map.get(r["Status"],0) for r in rows]
+    scores=[score_map.get(r["Status"],0) for r in readiness_rows]
     score_df=pd.DataFrame({"Phase":phase_names,"Readiness":scores}).set_index("Phase")
     st.bar_chart(score_df)
 
