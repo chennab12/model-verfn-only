@@ -68,3 +68,44 @@ Streamlit Community Cloud normally cannot verify a physical B70 because the hard
 ## Notes
 
 Disk and RAM headroom are conservative heuristics used to catch obvious setup problems. They are not formal model-memory requirements.
+
+
+## V3 TPM transparent Run Verification tab
+
+Only the **Run Verification** tab now expands every internal step and displays:
+
+- exact Python operation being run
+- actual runtime output
+- AI/ML core concept represented by that step
+- true purpose
+- what happens behind the scenes
+- equivalent Intel Arc Pro B60 behavior
+- equivalent Intel Arc Pro B70 behavior
+- why B60/B70 differ
+
+The visible execution sequence includes:
+
+1. import PyTorch/Transformers
+2. select device
+3. select numerical precision
+4. load tokenizer
+5. load model architecture + weights
+6. place model on device
+7. apply chat template
+8. tokenize to tensors
+9. move input tensors to device
+10. autoregressive generation
+11. isolate new tokens
+12. decode token IDs
+13. functional PASS/FAIL gate
+
+### B60 vs B70 learning point
+
+The Hugging Face/PyTorch functional flow is essentially the same because both use Intel's XPU path.
+
+The practical hardware differences are capacity and compute:
+
+- Arc Pro B60: 24 GB GDDR6, 456 GB/s memory bandwidth, 160 XMX engines
+- Arc Pro B70: 32 GB GDDR6, 608 GB/s memory bandwidth, 256 XMX engines
+
+This means the main functional-verification differences are likely to appear around model/context memory headroom and device/runtime behavior, rather than different Hugging Face code.

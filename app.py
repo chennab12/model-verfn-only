@@ -331,29 +331,121 @@ def runtime_snapshot():
 # -----------------------------
 # Functional verification
 # -----------------------------
+
 def run_verification(model_id, prompt, max_new_tokens, prefer_device, dtype_choice, trust_remote_code=False):
     result = {
-        "steps": [], "output": "", "device": None, "dtype": None,
-        "load_seconds": None, "generation_seconds": None, "error": None
+        "steps": [],
+        "output": "",
+        "device": None,
+        "dtype": None,
+        "load_seconds": None,
+        "generation_seconds": None,
+        "error": None,
+        "traceback": None,
     }
-    def add(step, status, detail):
-        result["steps"].append({"Step": step, "Status": status, "Detail": detail})
-    try:
-        import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        add("Import libraries", "PASS", f"torch={torch.__version__}")
 
+    def add_step(
+        number, name, status, command, output, purpose, behind_scenes,
+        concept, b60, b70, why_diff
+    ):
+        result["steps"].append({
+            "number": number,
+            "name": name,
+            "status": status,
+            "command": command,
+            "output": output,
+            "purpose": purpose,
+            "behind_scenes": behind_scenes,
+            "concept": concept,
+            "b60": b60,
+            "b70": b70,
+            "why_diff": why_diff,
+        })
+
+    try:
+        # Step 1: import core libraries
+        import torch
+        import transformers
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
+        add_step(
+            1,
+            "Import PyTorch + Transformers",
+            "PASS",
+            "import torch\nfrom transformers import AutoTokenizer, AutoModelForCausalLM",
+            f"torch={torch.__version__}; transformers={transformers.__version__}",
+            "Prove the core AI/ML software stack is importable before touching model files.",
+            "Python loads the framework modules into the process. PyTorch provides tensors/device execution; Transformers provides model/tokenizer abstractions.",
+            "Framework/runtime layer",
+            "Same Python imports. B60 still uses stock PyTorch's XPU backend when supported.",
+            "Same Python imports. B70 also uses the XPU backend.",
+            "No model-level difference here. B60/B70 differ in hardware capacity, not in the import/API surface."
+        )
+
+        # Step 2: resolve device
         device = resolve_device(prefer_device)
         result["device"] = device
-        add("Use preflight-selected device", "PASS", device)
+        device_detail = device
+        if device == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                device_detail = f"xpu · {torch.xpu.get_device_name(0)}"
+            except Exception:
+                pass
 
+        add_step(
+            2,
+            "Select execution device",
+            "PASS",
+            f"device = '{device}'",
+            f"Selected device: {device_detail}",
+            "Decide where tensor math and model inference will execute.",
+            "PyTorch routes tensor operations to a backend: CPU, CUDA, MPS, or XPU. Every model tensor and input tensor must ultimately land on the same backend.",
+            "Device abstraction / accelerator backend",
+            "Use XPU for B60. The logical API is `.to('xpu')`.",
+            "Use XPU for B70. The logical API is also `.to('xpu')`.",
+            "B60 and B70 use the same XPU programming model. B70 simply has more memory and compute headroom."
+        )
+
+        # Step 3: choose dtype
         dtype = selected_dtype(device, dtype_choice)
         result["dtype"] = str(dtype).replace("torch.", "")
+        add_step(
+            3,
+            "Choose numerical precision",
+            "PASS",
+            f"dtype = torch.{result['dtype']}",
+            f"Selected dtype: {result['dtype']}",
+            "Choose how model weights and arithmetic are represented in memory.",
+            "Lower precision usually reduces memory use and can improve accelerator throughput, but functional support must exist for the selected backend/operator path.",
+            "Precision / datatype",
+            "FP16/BF16 may reduce B60 memory pressure, which is useful with 24 GB VRAM.",
+            "FP16/BF16 is also useful on B70; its 32 GB VRAM gives more headroom.",
+            "The API is the same. B70's larger 32 GB memory means fewer capacity constraints than B60's 24 GB."
+        )
 
+        # Step 4: tokenizer
         t0 = time.perf_counter()
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-        add("Load tokenizer", "PASS", tokenizer.__class__.__name__)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code
+        )
+        tok_elapsed = time.perf_counter() - t0
+        add_step(
+            4,
+            "Load tokenizer",
+            "PASS",
+            f"AutoTokenizer.from_pretrained('{model_id}')",
+            f"{tokenizer.__class__.__name__} loaded in {tok_elapsed:.2f}s",
+            "Load the component that converts human-readable text into token IDs understood by the model.",
+            "Tokenizer files such as vocabulary, merges, tokenizer config, and chat template are loaded on the host. Tokenization normally happens on CPU before tensors are sent to the accelerator.",
+            "Tokenization",
+            "Same tokenizer and same host-side operation for B60.",
+            "Same tokenizer and same host-side operation for B70.",
+            "No meaningful B60/B70 difference because this is primarily CPU-side preprocessing."
+        )
 
+        # Step 5: model config/weights
+        t1 = time.perf_counter()
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=dtype,
@@ -361,24 +453,107 @@ def run_verification(model_id, prompt, max_new_tokens, prefer_device, dtype_choi
             low_cpu_mem_usage=True,
         )
         model.eval()
-        model.to(device)
-        result["load_seconds"] = time.perf_counter() - t0
-        add("Load model", "PASS",
-            f"{model.__class__.__name__} on {device} as {result['dtype']}")
+        weight_elapsed = time.perf_counter() - t1
 
+        param_count = sum(p.numel() for p in model.parameters())
+        add_step(
+            5,
+            "Load model configuration + weights",
+            "PASS",
+            "AutoModelForCausalLM.from_pretrained(...)\nmodel.eval()",
+            f"{model.__class__.__name__}; parameters={param_count:,}; host load={weight_elapsed:.2f}s",
+            "Instantiate the neural-network architecture and load pretrained parameters.",
+            "Transformers reads the model config, builds the Qwen causal-LM module graph, then loads tensor weights from the downloaded checkpoint. `eval()` disables training-only behavior such as dropout.",
+            "Model architecture + pretrained parameters",
+            "Same Qwen model architecture. B60's 24 GB VRAM may become relevant for larger models once weights are moved to XPU.",
+            "Same architecture. B70's 32 GB VRAM provides more capacity for larger models or context/cache.",
+            "Hugging Face model loading is identical. Hardware differences matter mainly once weights and activations occupy accelerator memory."
+        )
+
+        # Step 6: move model to device
+        td = time.perf_counter()
+        model.to(device)
+        move_elapsed = time.perf_counter() - td
+        add_step(
+            6,
+            "Place model on target device",
+            "PASS",
+            f"model.to('{device}')",
+            f"Model moved to {device} in {move_elapsed:.2f}s",
+            "Put model parameter tensors on the hardware that will perform inference.",
+            "PyTorch allocates device memory and copies or materializes parameter tensors on the target backend. Operator dispatch will later use that device's kernels.",
+            "Tensor placement / device memory",
+            "On B60 this becomes XPU allocation into 24 GB GDDR6.",
+            "On B70 this becomes XPU allocation into 32 GB GDDR6.",
+            "This is where B70's larger VRAM can materially reduce out-of-memory risk versus B60."
+        )
+
+        result["load_seconds"] = tok_elapsed + weight_elapsed + move_elapsed
+
+        # Step 7: prompt formatting
         messages = [{"role": "user", "content": prompt}]
         if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            formatted = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
             )
+            template_note = "chat template applied"
         else:
-            text = prompt
+            formatted = prompt
+            template_note = "raw prompt used"
 
-        inputs = tokenizer(text, return_tensors="pt")
+        add_step(
+            7,
+            "Apply chat/instruction template",
+            "PASS",
+            "tokenizer.apply_chat_template(messages, add_generation_prompt=True)",
+            f"{template_note}; formatted prompt length={len(formatted)} characters",
+            "Convert a user message into the exact text structure the instruction-tuned model expects.",
+            "Instruction-tuned models are trained on role markers/system-user-assistant structure. The chat template inserts those control tokens/text patterns consistently.",
+            "Prompt formatting / instruction tuning",
+            "Same formatted prompt for B60.",
+            "Same formatted prompt for B70.",
+            "No hardware difference. Keeping the prompt identical is important for fair backend comparison."
+        )
+
+        # Step 8: tokenize
+        inputs = tokenizer(formatted, return_tensors="pt")
+        token_count = int(inputs["input_ids"].shape[-1])
+        token_preview = inputs["input_ids"][0][:12].tolist()
+        add_step(
+            8,
+            "Tokenize prompt into tensors",
+            "PASS",
+            "inputs = tokenizer(formatted_prompt, return_tensors='pt')",
+            f"input_tokens={token_count}; first token IDs={token_preview}",
+            "Convert formatted text into numeric token IDs and attention tensors.",
+            "The tokenizer maps text pieces to integer vocabulary IDs. PyTorch wraps them in tensors, usually shape [batch, sequence_length].",
+            "Tokens / tensors / sequence length",
+            "Same token IDs and tensor shapes for B60.",
+            "Same token IDs and tensor shapes for B70.",
+            "Tokenization result is hardware-independent. Sequence length later affects memory and compute on both GPUs."
+        )
+
+        # Step 9: move inputs
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        add("Prepare prompt", "PASS", f"Input tokens: {inputs['input_ids'].shape[-1]}")
+        shapes = {k: list(v.shape) for k, v in inputs.items()}
+        add_step(
+            9,
+            "Move input tensors to target device",
+            "PASS",
+            f"inputs = {{k: v.to('{device}') for k, v in inputs.items()}}",
+            f"Device tensors: {shapes}",
+            "Ensure model inputs and model parameters reside on the same execution device.",
+            "A model cannot normally execute if parameters are on one backend and inputs on another. This step copies input tensors into accelerator-visible memory.",
+            "Host-to-device transfer",
+            "On B60, prompt tensors move to XPU memory alongside the model.",
+            "On B70, the same XPU transfer occurs.",
+            "Same operation. B70's higher memory bandwidth may matter for performance, but not for basic functional correctness."
+        )
 
-        t1 = time.perf_counter()
+        # Step 10: generate
+        tgen = time.perf_counter()
         with torch.no_grad():
             out = model.generate(
                 **inputs,
@@ -390,28 +565,107 @@ def run_verification(model_id, prompt, max_new_tokens, prefer_device, dtype_choi
             torch.cuda.synchronize()
         elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
             torch.xpu.synchronize()
-        result["generation_seconds"] = time.perf_counter() - t1
-        add("Generate", "PASS", f"Completed in {result['generation_seconds']:.2f}s")
+        result["generation_seconds"] = time.perf_counter() - tgen
 
+        total_out_tokens = int(out.shape[-1])
+        add_step(
+            10,
+            "Run autoregressive generation",
+            "PASS",
+            "with torch.no_grad():\n    model.generate(..., do_sample=False, max_new_tokens=N)",
+            f"generation_time={result['generation_seconds']:.2f}s; total_output_tokens={total_out_tokens}",
+            "Actually execute the LLM forward passes required to produce new tokens.",
+            "The model first processes the prompt (prefill), then repeatedly predicts one next token at a time (decode). `torch.no_grad()` disables gradient tracking because this is inference, not training.",
+            "Inference · prefill · decode · autoregressive generation",
+            "B60 executes the same XPU kernels but has 160 XMX engines, 24 GB GDDR6, and 456 GB/s memory bandwidth.",
+            "B70 runs the same logical graph with 256 XMX engines, 32 GB GDDR6, and 608 GB/s memory bandwidth.",
+            "Functional flow is identical. B70 has more compute/memory resources, so larger workloads may fit or run faster, but a PASS criterion is the same."
+        )
+
+        # Step 11: isolate generated portion
         new_tokens = out[0][inputs["input_ids"].shape[-1]:]
+        new_count = int(new_tokens.shape[-1])
+        add_step(
+            11,
+            "Separate newly generated tokens",
+            "PASS",
+            "new_tokens = output_ids[0][input_length:]",
+            f"new_tokens={new_count}; token IDs={new_tokens[:16].tolist()}",
+            "Separate the model's answer from the original prompt tokens.",
+            "Generation output often includes the original input sequence followed by generated IDs. Slicing at input length isolates only the completion.",
+            "Sequence slicing / generated token count",
+            "Same tensor slicing for B60.",
+            "Same tensor slicing for B70.",
+            "No hardware-specific difference."
+        )
+
+        # Step 12: decode
         text_out = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         result["output"] = text_out
+        add_step(
+            12,
+            "Decode token IDs back to text",
+            "PASS" if text_out else "FAIL",
+            "tokenizer.decode(new_tokens, skip_special_tokens=True)",
+            text_out if text_out else "<empty output>",
+            "Turn numeric output tokens back into readable text.",
+            "The tokenizer reverses vocabulary IDs into text pieces and removes special control tokens.",
+            "Decoding / post-processing",
+            "Same CPU-side decoding for B60.",
+            "Same CPU-side decoding for B70.",
+            "No meaningful accelerator difference."
+        )
 
+        # Step 13: functional gate
         if not text_out:
-            add("Validate output", "FAIL", "Decoded output was empty.")
             result["error"] = "Empty generated output."
+            add_step(
+                13,
+                "Apply functional PASS/FAIL gate",
+                "FAIL",
+                "assert generated_text.strip() != ''",
+                "FAIL: generation completed but decoded output is empty.",
+                "Produce a simple, reproducible functional verdict.",
+                "The verifier does not judge benchmark performance or answer quality deeply. It only verifies that the full inference path completed and produced usable text.",
+                "Functional qualification gate",
+                "B60 PASS requires the same gates to succeed specifically on XPU/B60.",
+                "B70 PASS requires the same gates to succeed specifically on XPU/B70.",
+                "The acceptance criterion is the same; only the target hardware identity changes."
+            )
             return result
 
-        add("Validate output", "PASS",
-            f"Generated {len(new_tokens)} new token(s); non-empty output.")
-        add("Functional verdict", "PASS",
-            "Tokenizer + model + device placement + generation + output validation succeeded.")
+        add_step(
+            13,
+            "Apply functional PASS/FAIL gate",
+            "PASS",
+            "PASS = tokenizer_load && model_load && device_placement && generation && non_empty_output",
+            "PASS: complete inference path succeeded and produced non-empty text.",
+            "Produce a narrow functional verdict before any benchmarking or optimization work begins.",
+            "This confirms software compatibility and basic inference functionality. It does not prove performance, production stability, numerical parity, or quality equivalence.",
+            "Functional qualification",
+            "B60: functional PASS on B60/XPU only.",
+            "B70: functional PASS on B70/XPU only.",
+            "A model may pass on CPU or one Intel GPU and still fail on another due to memory limits or backend/operator/runtime differences."
+        )
+
         return result
 
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
-        add("Functional verdict", "FAIL", result["error"])
+        add_step(
+            len(result["steps"]) + 1,
+            "Failure captured",
+            "FAIL",
+            "exception handler",
+            result["error"],
+            "Capture the exact point and reason the functional path stopped.",
+            "The traceback preserves the failing Python call chain so a TPM/engineer can classify the issue into model, framework, runtime, device, memory, or environment layers.",
+            "Failure isolation / reproducibility",
+            "On B60, classify whether the failure is XPU/runtime, memory-capacity, dtype, operator, driver, or model-level.",
+            "On B70, use the same classification; larger memory may eliminate some B60 capacity failures.",
+            "The debug method is the same. Hardware capacity can change which failure appears."
+        )
         return result
 
 COMPARISON = [
@@ -521,7 +775,7 @@ with tabs[0]:
                 st.write(f"• **{item['Check']}** — {item['Detail']}")
 
 with tabs[1]:
-    st.subheader("Functional smoke test")
+    st.subheader("Functional smoke test — TPM transparent mode")
     pf = st.session_state.get("preflight")
     ready = bool(pf and pf.get("ready"))
 
@@ -535,7 +789,10 @@ with tabs[1]:
         value="Reply with one short sentence explaining what a GPU does.",
         height=90
     )
-    st.caption("This is functional verification, not a benchmark.")
+    st.caption(
+        "This tab intentionally exposes the internal AI/ML flow. "
+        "It is functional verification, not a performance benchmark."
+    )
 
     if st.button(
         "▶ Run functional verification",
@@ -550,20 +807,76 @@ with tabs[1]:
 
     result = st.session_state.get("last_result")
     if result:
-        passed = result["steps"] and result["steps"][-1]["Status"] == "PASS"
+        passed = result["steps"] and result["steps"][-1]["status"] == "PASS"
         st.success("✅ FUNCTIONAL PASS") if passed else st.error("❌ FUNCTIONAL FAIL")
+
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Device", result.get("device") or "—")
         c2.metric("Dtype", result.get("dtype") or "—")
-        c3.metric("Load time", f"{result['load_seconds']:.2f}s" if result.get("load_seconds") is not None else "—")
-        c4.metric("Generate time", f"{result['generation_seconds']:.2f}s" if result.get("generation_seconds") is not None else "—")
-        st.dataframe(result["steps"], use_container_width=True, hide_index=True)
+        c3.metric(
+            "Load time",
+            f"{result['load_seconds']:.2f}s"
+            if result.get("load_seconds") is not None else "—"
+        )
+        c4.metric(
+            "Generate time",
+            f"{result['generation_seconds']:.2f}s"
+            if result.get("generation_seconds") is not None else "—"
+        )
+
+        st.markdown("### Behind-the-scenes execution steps")
+
+        for step in result["steps"]:
+            icon = "✅" if step["status"] == "PASS" else "❌"
+            with st.expander(
+                f"{icon} Step {step['number']} · {step['name']}",
+                expanded=True
+            ):
+                m1,m2 = st.columns([1,1])
+                with m1:
+                    st.markdown("#### Exact core operation")
+                    st.code(step["command"], language="python")
+                    st.markdown("#### Actual runtime output")
+                    if step["status"] == "PASS":
+                        st.success(step["output"])
+                    else:
+                        st.error(step["output"])
+                    st.markdown("#### AI/ML core concept")
+                    st.info(step["concept"])
+                with m2:
+                    st.markdown("#### True purpose")
+                    st.write(step["purpose"])
+                    st.markdown("#### What happens behind the scenes")
+                    st.write(step["behind_scenes"])
+
+                st.markdown("#### Intel Arc Pro comparison")
+                compare_rows = [
+                    {
+                        "Target": "Intel Arc Pro B60",
+                        "What changes": step["b60"],
+                    },
+                    {
+                        "Target": "Intel Arc Pro B70",
+                        "What changes": step["b70"],
+                    },
+                    {
+                        "Target": "Why the difference",
+                        "What changes": step["why_diff"],
+                    },
+                ]
+                st.dataframe(
+                    compare_rows,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
         if result.get("output"):
-            st.subheader("Generated output")
+            st.subheader("Final generated output")
             st.code(result["output"], language="text")
+
         if result.get("error"):
             st.error(result["error"])
-            with st.expander("Traceback"):
+            with st.expander("Technical traceback"):
                 st.code(result.get("traceback",""), language="text")
 
 with tabs[2]:
