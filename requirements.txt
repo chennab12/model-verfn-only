@@ -5,3 +5,5 @@ accelerate>=1.0
 safetensors>=0.4
 huggingface-hub>=0.26
 psutil>=5.9
+
+pandas>=2.0
