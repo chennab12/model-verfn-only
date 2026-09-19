@@ -92,3 +92,8 @@ A regression baseline is valid only if the candidate uses the same:
 - dtype selection
 
 If any of these differ, V6 rejects the regression comparison instead of reporting a misleading delta.
+
+
+## Phase 4 parity hotfix
+
+On CPU-only hosted environments, Phase 4 now skips duplicate CPU-vs-CPU model loading and returns an educational dry-run verdict. On real CUDA/XPU/MPS hardware, it still performs the full CPU-reference vs target-backend comparison, with aggressive cleanup between model loads.

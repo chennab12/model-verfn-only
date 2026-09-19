@@ -876,41 +876,115 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
     try:
         import torch
         import transformers
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from transformers import AutoTokenizer
 
-        add_step(1, "Import PyTorch + Transformers", "PASS",
-                 "import torch\nfrom transformers import AutoTokenizer, AutoModelForCausalLM",
-                 f"torch={torch.__version__}; transformers={transformers.__version__}",
-                 "Initialize the libraries needed for reference-vs-target comparison.",
-                 "Phase 4 compares two executions of the same model configuration on different backends.",
-                 "Framework/runtime comparison setup",
-                 "Same logic on B60.", "Same logic on B70.",
-                 "Hardware changes the target backend, not the comparison methodology.")
+        add_step(
+            1, "Import PyTorch + Transformers", "PASS",
+            "import torch\\nfrom transformers import AutoTokenizer",
+            f"torch={torch.__version__}; transformers={transformers.__version__}",
+            "Initialize the libraries needed for reference-vs-target comparison.",
+            "Phase 4 compares behavior across two execution backends only when two distinct backends actually exist.",
+            "Framework/runtime comparison setup",
+            "Same setup for B60.", "Same setup for B70.",
+            "Hardware changes the target backend, not the parity methodology."
+        )
 
         target_device = resolve_device(prefer_device)
         result["device"] = target_device
         target_dtype = selected_dtype(target_device, dtype_choice)
         result["dtype"] = str(target_dtype).replace("torch.", "")
-        add_step(2, "Define reference and target paths", "PASS",
-                 "reference_device='cpu'; target_device=selected_backend",
-                 f"reference=cpu/fp32; target={target_device}/{result['dtype']}",
-                 "Create a CPU reference path and a target-backend path for parity comparison.",
-                 "CPU is used as a practical baseline because it is often the most universal functional reference.",
-                 "Reference-vs-target methodology",
-                 "B60 becomes the target XPU path when selected.", "B70 becomes the target XPU path when selected.",
-                 "The reference path stays CPU; only the target hardware changes.")
+
+        add_step(
+            2, "Define reference and target paths", "PASS",
+            "reference_device='cpu'; target_device=selected_backend",
+            f"reference=cpu/fp32; target={target_device}/{result['dtype']}",
+            "Create a CPU reference path and a distinct target path when one is available.",
+            "CPU is the practical reference. A meaningful backend parity test requires the target backend to be different from CPU.",
+            "Reference-vs-target methodology",
+            "B60 becomes the XPU target when physically available.",
+            "B70 becomes the XPU target when physically available.",
+            "CPU-vs-CPU does not validate accelerator correctness, so duplicating the model would waste memory without adding evidence."
+        )
+
+        if target_device == "cpu":
+            result["summary"] = {
+                "mode": "educational_skip",
+                "skipped_duplicate_cpu_run": True,
+                "same_text_exact": None,
+                "same_text_normalized": None,
+                "top1_match": None,
+                "top5_overlap": None,
+                "max_abs_diff": None,
+                "mean_abs_diff": None,
+            }
+
+            add_step(
+                3, "Detect same-backend parity condition", "PASS",
+                "if target_device == 'cpu': skip_duplicate_backend_run()",
+                "Target backend is CPU, which is the same backend as the CPU reference.",
+                "Prevent an expensive comparison that cannot prove accelerator parity.",
+                "A parity test is useful only when comparing genuinely different execution paths.",
+                "Parity test validity",
+                "On a B60 machine, target resolves to XPU and this skip does not happen.",
+                "On a B70 machine, target resolves to XPU and this skip does not happen.",
+                "Streamlit Community Cloud is commonly CPU-only, so CPU-vs-CPU would only duplicate work and memory."
+            )
+
+            add_step(
+                4, "Skip duplicate model loading", "PASS",
+                "# intentionally do not load CPU reference + CPU target copies",
+                "Duplicate CPU model load skipped to avoid unnecessary RAM pressure.",
+                "Avoid the main cause of Phase 4 hanging on constrained hosted environments.",
+                "Loading the same model twice in one process can push a small Streamlit instance toward memory pressure, swapping, or process termination.",
+                "Memory-aware qualification",
+                "B60 path loads CPU reference once, releases it, then loads B60/XPU target.",
+                "B70 path loads CPU reference once, releases it, then loads B70/XPU target.",
+                "The safe hosted path avoids a second CPU copy because it provides no additional parity evidence."
+            )
+
+            add_step(
+                5, "Explain the meaningful parity path", "PASS",
+                "CPU reference  ->  XPU target  ->  compare text/logits",
+                "Meaningful parity requires CPU vs CUDA/XPU, not CPU vs CPU.",
+                "Teach the TPM what should happen on real accelerator infrastructure.",
+                "The same prompt, tokenizer, generation settings, and model stay constant while only the backend changes.",
+                "Controlled backend comparison",
+                "B60: compare CPU/fp32 reference against B60/XPU target.",
+                "B70: compare CPU/fp32 reference against B70/XPU target.",
+                "Keeping workload constant isolates backend/runtime differences."
+            )
+
+            result["output"] = (
+                "PARITY DRY-RUN / SKIPPED: selected target is CPU, the same as the CPU reference. "
+                "A second model load was intentionally skipped to avoid unnecessary Streamlit Cloud RAM pressure. "
+                "Run this same tab on CUDA/XPU hardware for a meaningful CPU-vs-accelerator parity comparison."
+            )
+
+            add_step(
+                6, "Apply hosted CPU parity verdict", "PASS",
+                "return educational_skip when reference_backend == target_backend",
+                result["output"],
+                "Finish Phase 4 safely without pretending CPU-vs-CPU proves accelerator correctness.",
+                "This is an educational PASS for the workflow itself, not a hardware parity qualification.",
+                "Scoped parity verdict",
+                "B60 hardware still requires a real CPU-vs-B60/XPU run.",
+                "B70 hardware still requires a real CPU-vs-B70/XPU run.",
+                "Skipping invalid work is better than reporting a misleading parity result."
+            )
+            return result
 
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-        add_step(3, "Load shared tokenizer", "PASS",
-                 f"AutoTokenizer.from_pretrained('{model_id}')",
-                 f"{tokenizer.__class__.__name__} loaded",
-                 "Guarantee that both CPU and target runs use identical tokenization and prompt formatting.",
-                 "A shared tokenizer prevents false parity differences caused by preprocessing mismatches.",
-                 "Shared preprocessing baseline",
-                 "Same tokenizer for CPU and B60.", "Same tokenizer for CPU and B70.",
-                 "Parity requires preprocessing to stay constant.")
+        add_step(
+            3, "Load shared tokenizer", "PASS",
+            f"AutoTokenizer.from_pretrained('{model_id}')",
+            f"{tokenizer.__class__.__name__} loaded",
+            "Guarantee CPU and target runs use identical preprocessing.",
+            "One shared tokenizer prevents differences caused by prompt preprocessing.",
+            "Shared preprocessing baseline",
+            "Same tokenizer for CPU and B60.", "Same tokenizer for CPU and B70.",
+            "Parity requires identical token IDs across both paths."
+        )
 
-        # Prepare identical text and cpu inputs
         messages = [{"role": "user", "content": prompt}]
         if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
             formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -918,49 +992,65 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
             formatted = prompt
         cpu_inputs = tokenizer(formatted, return_tensors="pt")
         input_len = int(cpu_inputs["input_ids"].shape[-1])
-        add_step(4, "Prepare identical reference prompt", "PASS",
-                 "formatted = tokenizer.apply_chat_template(...)\ncpu_inputs = tokenizer(formatted, return_tensors='pt')",
-                 f"formatted_length={len(formatted)} chars; input_tokens={input_len}",
-                 "Ensure both runs see exactly the same prompt content and token IDs.",
-                 "Parity comparisons are only meaningful when the model input is identical across paths.",
-                 "Controlled experimental input",
-                 "Same prompt and token IDs for B60 comparison.", "Same prompt and token IDs for B70 comparison.",
-                 "Any input mismatch would invalidate the parity check.")
 
-        # CPU reference path
+        add_step(
+            4, "Prepare identical reference prompt", "PASS",
+            "formatted = tokenizer.apply_chat_template(...)\\ncpu_inputs = tokenizer(formatted, return_tensors='pt')",
+            f"formatted_length={len(formatted)} chars; input_tokens={input_len}",
+            "Ensure both runs see exactly the same prompt and token IDs.",
+            "A controlled experiment changes only the execution backend.",
+            "Controlled experimental input",
+            "Same token IDs for B60 comparison.", "Same token IDs for B70 comparison.",
+            "Any input mismatch would invalidate the comparison."
+        )
+
         cpu_model = load_causal_model(model_id, torch.float32, trust_remote_code).to("cpu")
         with torch.no_grad():
             cpu_logits = cpu_model(**cpu_inputs).logits[0, -1, :].float().cpu()
-            cpu_gen = deterministic_generate(cpu_model, 
-                **cpu_inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id
+            cpu_gen = deterministic_generate(
+                cpu_model, **cpu_inputs, max_new_tokens=max_new_tokens,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id
             )
         cpu_new = cpu_gen[0][input_len:]
         cpu_text = tokenizer.decode(cpu_new, skip_special_tokens=True).strip()
-        cpu_top5 = torch.topk(cpu_logits, k=5)
-        cpu_top5_ids = cpu_top5.indices.tolist()
-        # Keep only CPU evidence; do not retain the full CPU model while loading target model.
-        cpu_logits_ref = cpu_logits.clone()
+        cpu_top5_ids = torch.topk(cpu_logits, k=5).indices.tolist()
+        cpu_logits_ref = cpu_logits.detach().clone()
         result["samples"].append(f"CPU output: {cpu_text}")
-        add_step(5, "Run CPU reference inference", "PASS",
-                 "cpu_model = AutoModelForCausalLM.from_pretrained(...).to('cpu')\nlogits = cpu_model(**cpu_inputs).logits\ncpu_model.generate(...)",
-                 f"cpu_output_len={len(cpu_new)}; cpu_top5_next_token_ids={cpu_top5_ids}; cpu_text={cpu_text[:120]}",
-                 "Create a baseline output and baseline next-token distribution.",
-                 "The CPU run gives a practical reference for both decoded text and the logits used to choose next tokens.",
-                 "Reference inference / logits baseline",
-                 "B60 will be compared against this CPU reference.", "B70 will be compared against this CPU reference.",
-                 "CPU is a common baseline because it is widely available and often easier to trust/debug.")
 
-        # Release the CPU model before loading a second copy. This prevents Streamlit Cloud RAM spikes.
-        del cpu_model, cpu_gen
+        add_step(
+            5, "Run CPU reference inference", "PASS",
+            "cpu_model(...).logits\\ncpu_model.generate(...)",
+            f"cpu_output_len={len(cpu_new)}; cpu_top5={cpu_top5_ids}; cpu_text={cpu_text[:120]}",
+            "Capture reference text and next-token evidence before target execution.",
+            "The CPU path acts as a practical correctness baseline.",
+            "Reference inference / logits baseline",
+            "B60 target will be compared against this CPU evidence.",
+            "B70 target will be compared against this CPU evidence.",
+            "CPU is widely available and easier to debug as a baseline."
+        )
+
+        del cpu_model, cpu_gen, cpu_logits, cpu_new
+        gc.collect()
         cleanup_accelerator("cpu")
 
-        # Target path
+        add_step(
+            6, "Release CPU reference model before target load", "PASS",
+            "del cpu_model, cpu_gen, cpu_logits\\ngc.collect()\\ncleanup_accelerator('cpu')",
+            "CPU reference model released before loading target model.",
+            "Minimize peak process memory and avoid holding two model copies simultaneously.",
+            "Memory lifecycle / resource cleanup",
+            "Important before B60 target load on systems with constrained host RAM.",
+            "Important before B70 target load as well, even though B70 has more VRAM.",
+            "Host RAM pressure can still be a bottleneck regardless of accelerator VRAM."
+        )
+
         target_model = load_causal_model(model_id, target_dtype, trust_remote_code).to(target_device)
         tgt_inputs = {k: v.to(target_device) for k, v in cpu_inputs.items()}
         with torch.no_grad():
             tgt_logits = target_model(**tgt_inputs).logits[0, -1, :].float().cpu()
-            tgt_gen = deterministic_generate(target_model, 
-                **tgt_inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id
+            tgt_gen = deterministic_generate(
+                target_model, **tgt_inputs, max_new_tokens=max_new_tokens,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id
             )
         if target_device == "cuda":
             torch.cuda.synchronize()
@@ -968,18 +1058,20 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
             torch.xpu.synchronize()
         tgt_new = tgt_gen[0][input_len:]
         tgt_text = tokenizer.decode(tgt_new, skip_special_tokens=True).strip()
-        tgt_top5 = torch.topk(tgt_logits, k=5)
-        tgt_top5_ids = tgt_top5.indices.tolist()
+        tgt_top5_ids = torch.topk(tgt_logits, k=5).indices.tolist()
         result["samples"].append(f"Target output ({target_device}): {tgt_text}")
-        add_step(6, "Run target-backend inference", "PASS",
-                 "target_model = AutoModelForCausalLM.from_pretrained(...).to(target_device)\ntarget_logits = target_model(**target_inputs).logits\ntarget_model.generate(...)",
-                 f"target_output_len={len(tgt_new)}; target_top5_next_token_ids={tgt_top5_ids}; target_text={tgt_text[:120]}",
-                 "Run the same model/input on the chosen target backend so its behavior can be compared against CPU.",
-                 "This isolates backend-dependent numeric/runtime differences while keeping the model/prompt constant.",
-                 "Target inference / backend-specific execution",
-                 "If target is B60, this is the B60/XPU behavior being compared to CPU.",
-                 "If target is B70, this is the B70/XPU behavior being compared to CPU.",
-                 "Same comparison structure; only the target hardware changes.")
+
+        add_step(
+            7, "Run target-backend inference", "PASS",
+            "target_model(...).logits\\ntarget_model.generate(...)",
+            f"target_output_len={len(tgt_new)}; target_top5={tgt_top5_ids}; target_text={tgt_text[:120]}",
+            "Capture equivalent evidence on the accelerator backend.",
+            "The same model/input executes using the target runtime/device kernels.",
+            "Target inference / backend-specific execution",
+            "On B60 this is the XPU/B60 execution path.",
+            "On B70 this is the XPU/B70 execution path.",
+            "Only the backend/hardware should differ from the CPU reference."
+        )
 
         same_text_exact = cpu_text == tgt_text
         same_text_norm = normalize_text(cpu_text) == normalize_text(tgt_text)
@@ -989,6 +1081,8 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
         mean_abs_diff = float((cpu_logits_ref - tgt_logits).abs().mean().item())
 
         result["summary"] = {
+            "mode": "real_backend_parity",
+            "skipped_duplicate_cpu_run": False,
             "same_text_exact": same_text_exact,
             "same_text_normalized": same_text_norm,
             "top1_match": top1_match,
@@ -997,17 +1091,19 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
             "mean_abs_diff": mean_abs_diff,
         }
 
-        add_step(7, "Compare CPU vs target evidence", "PASS",
-                 "compare(decoded_text, top1, top5, logits_diff)",
-                 f"same_text_exact={same_text_exact}; normalized_match={same_text_norm}; "
-                 f"top1_match={top1_match}; top5_overlap={top5_overlap}; "
-                 f"max_abs_diff={max_abs_diff:.6f}; mean_abs_diff={mean_abs_diff:.6f}",
-                 "Convert both runs into comparable parity metrics.",
-                 "Phase 4 examines both human-readable output and lower-level next-token score similarity.",
-                 "Correctness / parity metrics",
-                 "B60 may show larger numeric drift than CPU yet still remain functionally acceptable.",
-                 "B70 may also differ numerically from CPU; exact equality is not always required for useful parity.",
-                 "Parity checks look for credible similarity rather than demanding bitwise identity across all backends.")
+        add_step(
+            8, "Compare CPU vs target evidence", "PASS",
+            "compare(decoded_text, top1, top5, logits_diff)",
+            f"same_text_exact={same_text_exact}; normalized_match={same_text_norm}; "
+            f"top1_match={top1_match}; top5_overlap={top5_overlap}; "
+            f"max_abs_diff={max_abs_diff:.6f}; mean_abs_diff={mean_abs_diff:.6f}",
+            "Convert the two executions into practical parity metrics.",
+            "Text comparison gives a human-readable signal; top-token/logit comparisons expose lower-level numeric behavior.",
+            "Correctness / parity metrics",
+            "B60 can differ numerically from CPU yet remain acceptably close.",
+            "B70 can also differ numerically from CPU; exact equality is not always required.",
+            "Different precisions and accelerator kernels can create small numeric differences."
+        )
 
         verdict_pass = bool(tgt_text) and (same_text_norm or top1_match == 1 or top5_overlap >= 3)
         result["output"] = (
@@ -1015,23 +1111,32 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
             f"normalized_text_match={same_text_norm} | top1_match={top1_match} | "
             f"top5_overlap={top5_overlap} | max_abs_diff={max_abs_diff:.6f}"
         )
-        add_step(8, "Apply Phase 4 parity verdict", "PASS" if verdict_pass else "WARN",
-                 "PASS if target output is credible vs CPU using text and next-token evidence",
-                 result["output"],
-                 "Provide a practical pre-benchmark confidence gate that target backend behavior is believable.",
-                 "Phase 4 does not require perfect bitwise identity. It asks whether the target backend behaves credibly enough to trust subsequent benchmarking.",
-                 "Reference parity / correctness gate",
-                 "B60 PASS means B60 behavior is acceptably close to CPU for this test.",
-                 "B70 PASS means B70 behavior is acceptably close to CPU for this test.",
-                 "A backend may be functional but still suspicious if parity metrics diverge too far from CPU.")
-        del target_model, tokenizer, tgt_inputs
+
+        add_step(
+            9, "Apply Phase 4 parity verdict", "PASS" if verdict_pass else "WARN",
+            "PASS if target behavior is credible vs CPU using text + token evidence",
+            result["output"],
+            "Provide a pre-benchmark confidence gate for target-backend correctness.",
+            "The goal is credible similarity, not mandatory bitwise identity across CPU and accelerator backends.",
+            "Reference parity / correctness gate",
+            "B60 PASS means B60 behavior is acceptably close to CPU for this workload.",
+            "B70 PASS means B70 behavior is acceptably close to CPU for this workload.",
+            "A backend can be functional but still suspicious if parity evidence diverges materially."
+        )
+
+        del target_model, tokenizer, tgt_inputs, tgt_gen, tgt_logits, tgt_new, cpu_inputs, cpu_logits_ref
+        gc.collect()
         cleanup_accelerator(target_device)
         return result
 
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
-        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
+        try:
+            gc.collect()
+            cleanup_accelerator(locals().get("target_device", None))
+        except Exception:
+            pass
         result["steps"].append({
             "number": len(result["steps"]) + 1,
             "name": "Failure captured",
@@ -1039,96 +1144,13 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
             "command": "exception handler",
             "output": result["error"],
             "purpose": "Capture the exact point and reason the parity flow stopped.",
-            "behind_scenes": "The traceback helps classify whether the failure came from CPU reference, target backend, or comparison logic.",
+            "behind_scenes": "The traceback helps distinguish CPU reference, memory, target runtime, device, and comparison failures.",
             "concept": "Failure isolation / parity debugging",
-            "b60": "Determine whether B60 failed while CPU succeeded, which is strong evidence of backend-specific issues.",
-            "b70": "Determine whether B70 failed while CPU succeeded, which is strong evidence of backend-specific issues.",
-            "why_diff": "Parity work is specifically designed to expose backend-specific correctness concerns before benchmarking."
+            "b60": "Determine whether B60 failed while CPU reference succeeded.",
+            "b70": "Determine whether B70 failed while CPU reference succeeded.",
+            "why_diff": "Parity is specifically meant to expose backend-specific correctness or runtime problems."
         })
         return result
-
-
-# -----------------------------
-# Shared lightweight benchmark helper
-# -----------------------------
-def quick_benchmark(model_id, prompt, max_new_tokens, prefer_device, dtype_choice,
-                    trust_remote_code=False, iterations=3, use_cache=True, use_inference_mode=True):
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    device = resolve_device(prefer_device)
-    dtype = selected_dtype(device, dtype_choice)
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-    model = load_causal_model(model_id, dtype, trust_remote_code).to(device)
-    messages=[{"role":"user","content":prompt}]
-    if hasattr(tokenizer,"apply_chat_template") and getattr(tokenizer,"chat_template",None):
-        formatted=tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
-    else:
-        formatted=prompt
-    host_inputs=tokenizer(formatted,return_tensors="pt")
-    input_tokens=int(host_inputs["input_ids"].shape[-1])
-    inputs={k:v.to(device) for k,v in host_inputs.items()}
-
-    def sync():
-        if device=="cuda": torch.cuda.synchronize()
-        elif device=="xpu" and hasattr(torch.xpu,"synchronize"): torch.xpu.synchronize()
-
-    # warm-up
-    ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
-    with ctx:
-        _=deterministic_generate(model, **inputs,max_new_tokens=min(4,max_new_tokens),do_sample=False,
-                         use_cache=use_cache,pad_token_id=tokenizer.eos_token_id)
-    sync()
-
-    prefill=[]; first_token=[]; gen=[]; out_counts=[]; texts=[]
-    for _ in range(iterations):
-        ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
-        sync(); t0=time.perf_counter()
-        with ctx:
-            _=model(**inputs,use_cache=use_cache)
-        sync(); prefill.append(time.perf_counter()-t0)
-
-        ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
-        sync(); tf=time.perf_counter()
-        with ctx:
-            _first=deterministic_generate(model, **inputs,max_new_tokens=1,do_sample=False,
-                                  use_cache=use_cache,pad_token_id=tokenizer.eos_token_id)
-        sync(); first_token.append(time.perf_counter()-tf)
-
-        ctx=torch.inference_mode() if use_inference_mode else torch.no_grad()
-        sync(); t1=time.perf_counter()
-        with ctx:
-            out=deterministic_generate(model, **inputs,max_new_tokens=max_new_tokens,do_sample=False,
-                               use_cache=use_cache,pad_token_id=tokenizer.eos_token_id)
-        sync(); elapsed=time.perf_counter()-t1; gen.append(elapsed)
-        new=out[0][input_tokens:]
-        out_counts.append(int(new.shape[-1]))
-        texts.append(tokenizer.decode(new,skip_special_tokens=True).strip())
-
-    avg_prefill=sum(prefill)/len(prefill)
-    avg_first=sum(first_token)/len(first_token)
-    avg_gen=sum(gen)/len(gen)
-    avg_out=sum(out_counts)/len(out_counts)
-    decode_time=max(avg_gen-avg_first,1e-9)
-    tok_s=avg_out/avg_gen if avg_gen>0 else 0.0
-    approx_decode_tok_s=max(avg_out-1,0)/decode_time if decode_time>0 and avg_out>1 else 0.0
-    approx_tpot_ms=(decode_time/max(avg_out-1,1))*1000 if avg_out>1 else 0.0
-    mean=avg_gen
-    variance=sum((x-mean)**2 for x in gen)/len(gen) if gen else 0.0
-    cv=(variance**0.5/mean*100) if mean else 0.0
-    metrics = {
-        "device":device,"dtype":str(dtype).replace("torch.",""),"iterations":iterations,
-        "input_tokens":input_tokens,"avg_output_tokens":avg_out,"prefill_ms":avg_prefill*1000,
-        "ttft_proxy_ms":avg_first*1000,"approx_tpot_ms":approx_tpot_ms,
-        "e2e_ms":avg_gen*1000,"tokens_per_s":tok_s,"approx_decode_tokens_per_s":approx_decode_tok_s,
-        "latency_cv_pct":cv,"memory":sample_memory_report(device),"output":texts[-1] if texts else "",
-        "all_outputs":texts,"use_cache":use_cache,"inference_mode":use_inference_mode,
-        "model_id":model_id,"prompt":prompt,"max_new_tokens":max_new_tokens,
-        "requested_device":prefer_device,"dtype_choice":dtype_choice,
-    }
-    del model, tokenizer, inputs, host_inputs
-    cleanup_accelerator(device)
-    return metrics
 
 # -----------------------------
 # Phase 5: performance benchmark
@@ -1532,6 +1554,11 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Phase 4 — correctness / parity against CPU reference")
+    st.caption(
+        "If the selected target resolves to CPU (common on Streamlit Community Cloud), "
+        "the app now skips the duplicate CPU-vs-CPU model load to avoid RAM pressure. "
+        "A full parity comparison runs only when the target is a distinct CUDA/XPU/MPS backend."
+    )
     pf=st.session_state.get("preflight");ready=bool(pf and pf.get("ready"))
     p_prompt=st.text_area("Prompt for parity comparison",value="In one short sentence, explain what tokenization does in an LLM.",height=90,key="phase4_prompt")
     if st.button("▶ Run Phase 4 parity",width="stretch",disabled=not ready):
