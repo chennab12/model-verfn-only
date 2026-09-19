@@ -11,6 +11,8 @@ import platform
 import importlib.util
 import gc
 import copy
+import inspect
+import statistics
 from pathlib import Path
 
 import streamlit as st
@@ -70,6 +72,15 @@ def resolve_device(prefer):
     auto = choose_device()
     return auto if prefer == "Auto" else prefer.lower()
 
+def hosted_safe_mode(device=None):
+    """Detect constrained CPU-only hosts such as Streamlit Community Cloud."""
+    try:
+        dev = device or choose_device()
+        total_gb = psutil.virtual_memory().total / (1024 ** 3)
+        return dev == "cpu" and total_gb <= 5.0
+    except Exception:
+        return False
+
 def selected_dtype(device, choice):
     import torch
     if choice == "FP32":
@@ -78,6 +89,10 @@ def selected_dtype(device, choice):
         return torch.float16
     if choice == "BF16":
         return torch.bfloat16
+    # Auto: on constrained CPU hosts, FP16 materially reduces the ~0.5B model
+    # memory footprint. Explicit FP32 remains available from the sidebar.
+    if device == "cpu" and hosted_safe_mode(device):
+        return torch.float16
     return torch.float32 if device == "cpu" else torch.float16
 
 
@@ -106,12 +121,21 @@ def load_causal_model(model_id, dtype, trust_remote_code=False):
 
 
 def deterministic_generate(model, **kwargs):
-    """Generate deterministically without inheriting sampling warnings from model generation_config."""
+    """Greedy generation without sampling-only Qwen warnings."""
     cfg = copy.deepcopy(model.generation_config)
     cfg.do_sample = False
-    for attr in ("temperature", "top_p", "top_k", "typical_p", "min_p"):
+    # Keep neutral/default sampling values so Transformers validation stays quiet
+    # across stable v4 releases while greedy decoding remains active.
+    neutral = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 50,
+        "typical_p": 1.0,
+        "min_p": None,
+    }
+    for attr, value in neutral.items():
         if hasattr(cfg, attr):
-            setattr(cfg, attr, None)
+            setattr(cfg, attr, value)
     kwargs.pop("do_sample", None)
     return model.generate(generation_config=cfg, **kwargs)
 
@@ -160,6 +184,22 @@ def sample_memory_report(device):
         return "No accelerator memory metric required for CPU/MPS."
     except Exception as e:
         return f"Memory query skipped: {e}"
+
+def tab_note(icon, title, body):
+    st.info(f"{icon} **{title}:** {body}")
+
+def assumptions_box(items):
+    with st.expander("ℹ️ Assumptions & caveats", expanded=False):
+        for item in items:
+            st.write(f"• {item}")
+
+def fmt_metric(value, suffix="", digits=2, missing="—"):
+    if value is None:
+        return missing
+    try:
+        return f"{float(value):.{digits}f}{suffix}"
+    except Exception:
+        return str(value)
 
 def render_step_expanders(result, output_label="Final generated output", metrics=None):
     if result is None:
@@ -1159,210 +1199,122 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
         return result
 
 
-def quick_benchmark(
-    model_id,
-    prompt,
-    max_new_tokens,
-    prefer_device,
-    dtype_choice,
-    trust_remote_code=False,
-    iterations=3,
-    use_cache=True,
-    use_inference_mode=True,
-):
-    """
-    Shared lightweight benchmark engine for Phases 5/6/7.
-
-    Measures a fixed workload with:
-      - warm-up
-      - prefill latency
-      - one-token TTFT proxy
-      - full end-to-end generation
-      - tokens/sec
-      - approximate TPOT / decode throughput
-      - latency variability
-      - memory evidence
-
-    Always unloads the model before returning so later Streamlit tabs do not
-    accumulate model copies in process memory.
-    """
-    import statistics
+def _prepare_benchmark_bundle(model_id, prompt, prefer_device, dtype_choice, trust_remote_code=False):
     import torch
     from transformers import AutoTokenizer
-
     device = resolve_device(prefer_device)
     dtype = selected_dtype(device, dtype_choice)
-    tokenizer = None
-    model = None
-    inputs = None
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    model = load_causal_model(model_id, dtype, trust_remote_code).to(device)
+    messages = [{"role": "user", "content": prompt}]
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        formatted = prompt
+    host_inputs = tokenizer(formatted, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in host_inputs.items()}
+    return tokenizer, model, inputs, device, dtype
 
+def _sync_device(device):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            trust_remote_code=trust_remote_code,
-        )
-        model = load_causal_model(model_id, dtype, trust_remote_code).to(device)
-
-        messages = [{"role": "user", "content": prompt}]
-        if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-            formatted = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        else:
-            formatted = prompt
-
-        host_inputs = tokenizer(formatted, return_tensors="pt")
-        input_tokens = int(host_inputs["input_ids"].shape[-1])
-        inputs = {k: v.to(device) for k, v in host_inputs.items()}
-
-        # Warm-up. This is intentionally not included in measurements.
-        with torch.inference_mode() if use_inference_mode else torch.no_grad():
-            _ = deterministic_generate(
-                model,
-                **inputs,
-                max_new_tokens=min(4, max_new_tokens),
-                pad_token_id=tokenizer.eos_token_id,
-                use_cache=use_cache,
-            )
-        if device == "cuda":
+        import torch
+        if device == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize()
-        elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
+        elif device == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available() and hasattr(torch.xpu, "synchronize"):
             torch.xpu.synchronize()
+    except Exception:
+        pass
 
-        prefill_times = []
-        ttft_proxy_times = []
-        e2e_times = []
-        generated_counts = []
-        outputs = []
+def benchmark_loaded_model(model, tokenizer, inputs, device, max_new_tokens, iterations=3, use_cache=True, use_inference_mode=True):
+    """Measure one already-loaded model without retaining large intermediate tensors."""
+    import torch
+    safe = hosted_safe_mode(device)
+    effective_iterations = max(1, min(int(iterations), 2 if safe else int(iterations)))
+    effective_tokens = max(4, min(int(max_new_tokens), 16 if safe else int(max_new_tokens)))
+    input_tokens = int(inputs["input_ids"].shape[-1])
+    context = torch.inference_mode if use_inference_mode else torch.no_grad
 
-        mode_ctx = torch.inference_mode if use_inference_mode else torch.no_grad
+    # Minimal warm-up.
+    with context():
+        warm = deterministic_generate(model, **inputs, max_new_tokens=2, pad_token_id=tokenizer.eos_token_id, use_cache=use_cache)
+    _sync_device(device)
+    del warm
 
-        for _i in range(max(1, int(iterations))):
-            # Prefill measurement.
-            t0 = time.perf_counter()
-            with mode_ctx():
-                _prefill = model(**inputs, use_cache=use_cache)
-            if device == "cuda":
-                torch.cuda.synchronize()
-            elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
-                torch.xpu.synchronize()
-            prefill_times.append(time.perf_counter() - t0)
-            del _prefill
+    # TTFT proxy: one generated token.
+    t0=time.perf_counter()
+    with context():
+        one=deterministic_generate(model, **inputs, max_new_tokens=1, pad_token_id=tokenizer.eos_token_id, use_cache=use_cache)
+    _sync_device(device)
+    ttft_proxy_ms=(time.perf_counter()-t0)*1000.0
+    del one
 
-            # One-token generation = lightweight TTFT proxy for this non-streaming app.
-            t1 = time.perf_counter()
-            with mode_ctx():
-                one = deterministic_generate(
-                    model,
-                    **inputs,
-                    max_new_tokens=1,
-                    pad_token_id=tokenizer.eos_token_id,
-                    use_cache=use_cache,
-                )
-            if device == "cuda":
-                torch.cuda.synchronize()
-            elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
-                torch.xpu.synchronize()
-            ttft_proxy_times.append(time.perf_counter() - t1)
-            del one
-
-            # Full deterministic generation.
-            t2 = time.perf_counter()
-            with mode_ctx():
-                out = deterministic_generate(
-                    model,
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=tokenizer.eos_token_id,
-                    use_cache=use_cache,
-                )
-            if device == "cuda":
-                torch.cuda.synchronize()
-            elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
-                torch.xpu.synchronize()
-            elapsed = time.perf_counter() - t2
-            e2e_times.append(elapsed)
-
-            new_tokens = out[0][input_tokens:]
-            count = int(new_tokens.shape[-1])
-            generated_counts.append(count)
-            outputs.append(
-                tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-            )
-            del out, new_tokens
-
-        avg_prefill_s = sum(prefill_times) / len(prefill_times)
-        avg_ttft_s = sum(ttft_proxy_times) / len(ttft_proxy_times)
-        avg_e2e_s = sum(e2e_times) / len(e2e_times)
-        avg_output_tokens = sum(generated_counts) / len(generated_counts)
-
-        tokens_per_s = (
-            avg_output_tokens / avg_e2e_s
-            if avg_e2e_s > 0 and avg_output_tokens > 0
-            else 0.0
-        )
-
-        # Approximate decode-only metrics. In this small non-streaming HF path,
-        # subtract prefill from total generation as an educational approximation.
-        approx_decode_s = max(avg_e2e_s - avg_prefill_s, 1e-9)
-        approx_decode_tokens_per_s = (
-            avg_output_tokens / approx_decode_s
-            if avg_output_tokens > 0
-            else 0.0
-        )
-        approx_tpot_ms = (
-            (approx_decode_s / max(avg_output_tokens, 1.0)) * 1000.0
-        )
-
-        mean_e2e = avg_e2e_s
-        if len(e2e_times) >= 2 and mean_e2e > 0:
-            latency_cv_pct = statistics.pstdev(e2e_times) / mean_e2e * 100.0
-        else:
-            latency_cv_pct = 0.0
-
-        # Deterministic output should generally remain stable across measured runs.
-        nonempty_outputs = [o for o in outputs if o]
-        representative_output = nonempty_outputs[-1] if nonempty_outputs else ""
-        unique_output_count = len(set(nonempty_outputs)) if nonempty_outputs else 0
-
-        return {
-            "device": device,
-            "dtype": str(dtype).replace("torch.", ""),
-            "iterations": max(1, int(iterations)),
-            "input_tokens": input_tokens,
-            "avg_output_tokens": avg_output_tokens,
-            "prefill_ms": avg_prefill_s * 1000.0,
-            "ttft_proxy_ms": avg_ttft_s * 1000.0,
-            "e2e_ms": avg_e2e_s * 1000.0,
-            "tokens_per_s": tokens_per_s,
-            "approx_decode_tokens_per_s": approx_decode_tokens_per_s,
-            "approx_tpot_ms": approx_tpot_ms,
-            "latency_cv_pct": latency_cv_pct,
-            "memory": sample_memory_report(device),
-            "output": representative_output,
-            "unique_output_count": unique_output_count,
-            "use_cache": bool(use_cache),
-            "use_inference_mode": bool(use_inference_mode),
-            "raw_e2e_ms": [x * 1000.0 for x in e2e_times],
-        }
-    finally:
-        # Release all model/tensor objects even if a benchmark substep raises.
+    # Prefill: on low-memory hosted CPU skip a separate full-logits forward, because
+    # that allocation is unnecessary and can push Community Cloud over RAM limits.
+    prefill_is_proxy = safe
+    if safe:
+        prefill_ms = ttft_proxy_ms
+    else:
+        forward_kwargs={"use_cache": False}
         try:
-            del inputs
+            if "logits_to_keep" in inspect.signature(model.forward).parameters:
+                forward_kwargs["logits_to_keep"] = 1
         except Exception:
             pass
-        try:
-            del model
-        except Exception:
-            pass
-        try:
-            del tokenizer
-        except Exception:
-            pass
+        p0=time.perf_counter()
+        with context():
+            pref=model(**inputs, **forward_kwargs)
+        _sync_device(device)
+        prefill_ms=(time.perf_counter()-p0)*1000.0
+        del pref
+
+    e2e=[]; counts=[]; outputs=[]
+    for _ in range(effective_iterations):
+        g0=time.perf_counter()
+        with context():
+            out=deterministic_generate(model, **inputs, max_new_tokens=effective_tokens, pad_token_id=tokenizer.eos_token_id, use_cache=use_cache)
+        _sync_device(device)
+        elapsed=time.perf_counter()-g0
+        new=out[0][input_tokens:]
+        counts.append(int(new.shape[-1])); e2e.append(elapsed)
+        outputs.append(tokenizer.decode(new, skip_special_tokens=True).strip())
+        del out,new
         gc.collect()
-        cleanup_accelerator(device)
+
+    avg_e2e_s=sum(e2e)/len(e2e)
+    avg_tokens=sum(counts)/len(counts) if counts else 0.0
+    tok_s=avg_tokens/avg_e2e_s if avg_e2e_s>0 else 0.0
+    # Approximation only; true streaming TTFT/TPOT requires a serving stack or token timestamps.
+    approx_decode_s=max(avg_e2e_s-(prefill_ms/1000.0),1e-9)
+    approx_tpot_ms=approx_decode_s/max(avg_tokens,1.0)*1000.0
+    approx_decode_tok_s=avg_tokens/approx_decode_s if avg_tokens else 0.0
+    cv=(statistics.pstdev(e2e)/avg_e2e_s*100.0) if len(e2e)>=2 and avg_e2e_s>0 else 0.0
+    nonempty=[x for x in outputs if x]
+    return {
+        "device":device, "dtype":str(next(model.parameters()).dtype).replace("torch.",""),
+        "iterations":effective_iterations, "requested_iterations":int(iterations),
+        "effective_max_new_tokens":effective_tokens, "requested_max_new_tokens":int(max_new_tokens),
+        "input_tokens":input_tokens, "avg_output_tokens":avg_tokens,
+        "prefill_ms":prefill_ms, "prefill_is_proxy":prefill_is_proxy,
+        "ttft_proxy_ms":ttft_proxy_ms, "e2e_ms":avg_e2e_s*1000.0,
+        "tokens_per_s":tok_s, "approx_decode_tokens_per_s":approx_decode_tok_s,
+        "approx_tpot_ms":approx_tpot_ms, "latency_cv_pct":cv,
+        "memory":sample_memory_report(device), "output":nonempty[-1] if nonempty else "",
+        "unique_output_count":len(set(nonempty)) if nonempty else 0,
+        "use_cache":bool(use_cache), "use_inference_mode":bool(use_inference_mode),
+        "hosted_safe_mode":safe, "raw_e2e_ms":[x*1000.0 for x in e2e],
+    }
+
+def quick_benchmark(model_id, prompt, max_new_tokens, prefer_device, dtype_choice, trust_remote_code=False, iterations=3, use_cache=True, use_inference_mode=True):
+    tokenizer=model=inputs=None; device=resolve_device(prefer_device)
+    try:
+        tokenizer,model,inputs,device,_dtype=_prepare_benchmark_bundle(model_id,prompt,prefer_device,dtype_choice,trust_remote_code)
+        return benchmark_loaded_model(model,tokenizer,inputs,device,max_new_tokens,iterations,use_cache,use_inference_mode)
+    finally:
+        for name in ("inputs","model","tokenizer"):
+            if name in locals():
+                try: del locals()[name]
+                except Exception: pass
+        gc.collect(); cleanup_accelerator(device)
 
 
 # -----------------------------
@@ -1371,317 +1323,114 @@ def quick_benchmark(
 def run_phase5_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code=False,iterations=3):
     result={"steps":[],"output":"","samples":[],"error":None,"traceback":None,"summary":{}}
     def add(n,name,status,cmd,out,purpose,behind,concept,b60,b70,why):
-        result["steps"].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,
-            "purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
+        result["steps"].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,"purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
     try:
-        add(1,"Define benchmark workload","PASS",
-            "fixed_prompt + fixed max_new_tokens + fixed dtype + fixed iterations",
-            f"iterations={iterations}; max_new_tokens={max_new_tokens}; device={resolve_device(prefer_device)}",
-            "Make performance numbers comparable and reproducible.",
-            "Benchmarking only means something when model, prompt, precision, token counts and run count are controlled.",
-            "Benchmark methodology / controlled workload",
-            "Use the exact same workload when benchmarking B60.","Use the exact same workload when benchmarking B70.",
-            "Changing workload would make B60/B70 numbers incomparable.")
-        add(2,"Warm up model/runtime","PASS","model.generate(..., max_new_tokens=4)",
-            "One short warm-up run before measurements.",
-            "The first run can include lazy initialization, kernel setup and cache effects that should not dominate steady-state measurements.",
-            "Warm-up / steady-state measurement",
-            "B60 may have different first-run overhead than steady state.","B70 may have different first-run overhead than steady state.",
-            "Warm-up reduces one-time runtime noise on either device.")
+        safe=hosted_safe_mode(resolve_device(prefer_device))
+        add(1,"Define a fixed workload","PASS","freeze model + prompt + tokens + dtype + device",f"requested iterations={iterations}; requested max_new_tokens={max_new_tokens}; hosted_safe_mode={safe}","Make benchmark results comparable.","A valid benchmark changes as few variables as possible.","Controlled benchmark methodology","Use the identical workload on B60.","Use the identical workload on B70.","Hardware can differ; workload definition should not.")
         bm=quick_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code,iterations,True,True)
-        bm["baseline_signature"] = {
-            "model_id": model_id,
-            "prompt": prompt,
-            "max_new_tokens": max_new_tokens,
-            "device": resolve_device(prefer_device),
-            "requested_device": prefer_device,
-            "dtype_choice": dtype_choice,
-            "benchmark_engine": "quick_benchmark_v8",
-            "use_cache": True,
-            "use_inference_mode": True,
-        }
+        bm["baseline_signature"]={"model_id":model_id,"prompt":prompt,"max_new_tokens":max_new_tokens,"device":resolve_device(prefer_device),"requested_device":prefer_device,"dtype_choice":dtype_choice,"benchmark_engine":"quick_benchmark_v9","use_cache":True,"use_inference_mode":True}
         result["summary"]=bm; result["output"]=bm["output"]
-        add(3,"Measure prefill latency","PASS","model(**inputs, use_cache=True)",
-            f"avg_prefill={bm['prefill_ms']:.2f} ms; input_tokens={bm['input_tokens']}",
-            "Measure the cost of processing the full input prompt before token-by-token decode.",
-            "Prefill evaluates many prompt tokens in parallel and initializes attention/KV state for later decoding.",
-            "Prefill latency / prompt processing",
-            "B60 executes the same prefill graph with less compute/memory bandwidth.","B70 has more XMX/memory bandwidth headroom for the same prefill workload.",
-            "Prefill can be compute/memory intensive; hardware resources affect latency.")
-        add(4,"Measure first-token and end-to-end latency","PASS","model.generate(..., max_new_tokens=1)  # TTFT proxy\nmodel.generate(..., full output)",
-            f"TTFT_proxy={bm['ttft_proxy_ms']:.2f} ms; avg_e2e={bm['e2e_ms']:.2f} ms; avg_output_tokens={bm['avg_output_tokens']:.1f}",
-            "Measure a lightweight first-token latency proxy plus total request latency.",
-            "The one-token generation run approximates TTFT in this non-streaming app; full generation includes prompt processing plus repeated decode steps.",
-            "TTFT proxy / end-to-end latency",
-            "B60 measures the same user-visible path.","B70 measures the same user-visible path.",
-            "Same metric; faster hardware may reduce the time.")
-        add(5,"Calculate throughput","PASS","tokens_per_s = output_tokens / generation_seconds",
-            f"tokens/s={bm['tokens_per_s']:.2f}; approx_decode_tokens/s={bm['approx_decode_tokens_per_s']:.2f}; approx_TPOT={bm['approx_tpot_ms']:.2f} ms/token",
-            "Quantify how much generated-token work is completed per second.",
-            "Throughput complements latency: latency asks how long one request takes, throughput asks how much useful work is completed over time.",
-            "Generation throughput / decode throughput",
-            "B60 throughput reflects B60 compute and memory limits.","B70 throughput can benefit from greater compute/memory bandwidth.",
-            "Higher-resource hardware can sustain more token-generation work per unit time.")
-        add(6,"Check run-to-run variability","PASS" if bm['latency_cv_pct']<=15 else "WARN",
-            "CV = stddev(latency) / mean(latency) × 100",
-            f"latency_CV={bm['latency_cv_pct']:.2f}% across {iterations} measured run(s)",
-            "Detect noisy or unstable benchmark numbers before trusting comparisons.",
-            "A high coefficient of variation means results are too noisy for confident performance claims.",
-            "Benchmark stability / variance",
-            "B60 should also be evaluated for stable repeatable latency.","B70 should also be evaluated for stable repeatable latency.",
-            "Both devices need stable data; faster average speed is not enough if measurements are erratic.")
-        add(7,"Capture resource evidence","PASS","sample_memory_report(device)",bm['memory'],
-            "Keep memory/capacity context alongside speed metrics.",
-            "A faster result that nearly exhausts memory may be less deployable than a slightly slower configuration with healthy headroom.",
-            "Resource utilization / capacity evidence",
-            "B60 has 24 GB VRAM, so memory headroom is especially important.","B70 has 32 GB VRAM, allowing more headroom for larger models/context.",
-            "Capacity is a major practical distinction between B60 and B70.")
+        add(2,"Warm up then measure","PASS","warm-up → 1-token TTFT proxy → measured generation",f"effective iterations={bm['iterations']}; effective output cap={bm['effective_max_new_tokens']} tokens","Reduce cold-start noise and gather lightweight repeatable timings.","Hosted-safe mode automatically reduces iterations/output length to stay inside small Community Cloud memory/CPU budgets.","Steady-state benchmarking","Same procedure on B60.","Same procedure on B70.","Hosted CPU needs conservative workload sizing; dedicated accelerators can run fuller workloads.")
+        prefill_label="proxy" if bm.get("prefill_is_proxy") else "measured"
+        add(3,"Measure prompt/prefill cost","PASS", "model forward (or hosted-safe TTFT proxy)",f"prefill={bm['prefill_ms']:.2f} ms ({prefill_label}); input_tokens={bm['input_tokens']}","Estimate the cost before iterative decoding.","On constrained CPU hosts a separate full-logits forward is skipped to avoid an unnecessary RAM spike.","Prefill / prompt processing","Measure directly on B60 when resources allow.","Measure directly on B70 when resources allow.","The concept is the same; hosted-safe mode sacrifices precision for reliability.")
+        add(4,"Measure latency + throughput","PASS","generate(1 token) + generate(N tokens)",f"TTFT proxy={bm['ttft_proxy_ms']:.2f} ms; E2E={bm['e2e_ms']:.2f} ms; tok/s={bm['tokens_per_s']:.2f}; TPOT~={bm['approx_tpot_ms']:.2f} ms/tok","Capture user-visible latency and generation throughput.","TTFT/TPOT here are educational proxies because this is not a streaming serving engine.","LLM inference KPIs","B60 uses the same metrics.","B70 uses the same metrics.","Performance differs; KPI definitions do not.")
+        add(5,"Check benchmark stability","PASS" if bm['latency_cv_pct']<=20 else "WARN","CV = stddev / mean × 100",f"latency CV={bm['latency_cv_pct']:.2f}%","Detect noisy results before using them as a baseline.","High variance can come from shared-cloud CPU scheduling and is not necessarily a model bug.","Measurement variance","Dedicated B60 hosts should normally be less noisy.","Dedicated B70 hosts should normally be less noisy.","Community Cloud is shared infrastructure, so timing noise is expected.")
         verdict=bm['tokens_per_s']>0 and bool(bm['output'])
-        add(8,"Apply Phase 5 benchmark verdict","PASS" if verdict else "FAIL",
-            "PASS if measurements are valid, non-zero, and output remains functional",
-            f"prefill={bm['prefill_ms']:.2f} ms; TTFT_proxy={bm['ttft_proxy_ms']:.2f} ms; TPOT~={bm['approx_tpot_ms']:.2f} ms/token; e2e={bm['e2e_ms']:.2f} ms; tok/s={bm['tokens_per_s']:.2f}",
-            "Produce a trustworthy baseline performance record for later optimization and regression.",
-            "Phase 5 does not declare a platform winner; it establishes reproducible workload metrics.",
-            "Performance baseline",
-            "Store B60 metrics as a baseline when testing B60.","Store B70 metrics as a baseline when testing B70.",
-            "The same benchmark definition is required for fair comparison.")
+        add(6,"Create benchmark baseline","PASS" if verdict else "FAIL","save metrics + workload signature",f"E2E={bm['e2e_ms']:.2f} ms; throughput={bm['tokens_per_s']:.2f} tok/s","Create evidence that later optimization/regression phases can reuse.","A baseline includes both metrics and the exact workload definition.","Performance baseline","Store B60-specific baseline.","Store B70-specific baseline.","Do not compare unlike devices/workloads as regressions.")
         return result
     except Exception as e:
-        result["error"]=f"{type(e).__name__}: {e}"; result["traceback"]=traceback.format_exc()
-        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
-        add(len(result["steps"])+1,"Failure captured","FAIL","exception handler",result["error"],
-            "Capture exact benchmark failure evidence.","This helps distinguish setup, memory, runtime and measurement failures.",
-            "Benchmark failure isolation","Classify B60-specific failures.","Classify B70-specific failures.","Same debugging method; capacity may change failure mode.")
-        return result
+        result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc()
+        add(len(result['steps'])+1,"Benchmark could not complete","FAIL","exception handler",result['error'],"Expose a useful failure instead of leaving the tab spinning.","Most hosted failures are resource/dependency issues; the traceback is retained for diagnosis.","Benchmark failure isolation","Check B60 runtime/memory.","Check B70 runtime/memory.","Resource and backend failures require different fixes.")
+        cleanup_accelerator(resolve_device(prefer_device)); return result
 
 # -----------------------------
 # Phase 6: optimization
 # -----------------------------
 def run_phase6_optimization(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code=False,iterations=2):
     result={"steps":[],"output":"","samples":[],"error":None,"traceback":None,"summary":{}}
-    def add(n,name,status,cmd,out,purpose,behind,concept,b60,b70,why):
-        result["steps"].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,
-            "purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
+    def add(n,name,status,cmd,out,purpose,behind,concept,b60,b70,why): result['steps'].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,"purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
+    tokenizer=model=inputs=None; device=resolve_device(prefer_device)
     try:
-        add(1,"Choose one controlled optimization","PASS","baseline: use_cache=False + no_grad\noptimized: use_cache=True + inference_mode",
-            "Only one optimization family is changed while model/prompt/device/token counts stay fixed.",
-            "Isolating one change makes before/after performance differences easier to attribute.",
-            "Controlled optimization experiment",
-            "Apply the same before/after experiment on B60.","Apply the same before/after experiment on B70.",
-            "Optimization claims require a controlled comparison on each target device.")
-        baseline=quick_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code,iterations,False,False)
-        add(2,"Measure baseline configuration","PASS","use_cache=False; torch.no_grad()",
-            f"baseline_e2e={baseline['e2e_ms']:.2f} ms; baseline_tok/s={baseline['tokens_per_s']:.2f}",
-            "Establish what performance looks like before the candidate optimization.",
-            "Without a baseline, an optimized number has no causal meaning.",
-            "Before/after baseline",
-            "Baseline must be measured on B60 itself.","Baseline must be measured on B70 itself.",
-            "Each device has its own starting point.")
-        optimized=quick_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code,iterations,True,True)
-        add(3,"Measure optimized configuration","PASS","use_cache=True; torch.inference_mode()",
-            f"optimized_e2e={optimized['e2e_ms']:.2f} ms; optimized_tok/s={optimized['tokens_per_s']:.2f}",
-            "Measure the same workload after enabling inference-oriented execution and KV caching.",
-            "KV cache reuses attention state across decode steps; inference_mode removes autograd bookkeeping beyond no_grad semantics.",
-            "KV cache / inference-mode optimization",
-            "B60 benefits can be constrained by its smaller memory capacity.","B70 has more memory headroom for cache-heavy workloads.",
-            "KV cache trades memory for less repeated compute, so capacity matters.")
-        speedup=baseline['e2e_ms']/optimized['e2e_ms'] if optimized['e2e_ms']>0 else 0
-        improvement=(baseline['e2e_ms']-optimized['e2e_ms'])/baseline['e2e_ms']*100 if baseline['e2e_ms']>0 else 0
-        throughput_gain=(optimized['tokens_per_s']-baseline['tokens_per_s'])/baseline['tokens_per_s']*100 if baseline['tokens_per_s']>0 else 0
+        add(1,"Choose one controlled optimization","PASS","baseline: cache off + no_grad; candidate: cache on + inference_mode","Same loaded model and same workload used for both measurements.","Avoid repeated model loads while isolating the optimization change.","Controlled tuning experiment","Run the same A/B test on B60.","Run the same A/B test on B70.","The gain can vary by hardware even when the optimization is identical.")
+        tokenizer,model,inputs,device,_dtype=_prepare_benchmark_bundle(model_id,prompt,prefer_device,dtype_choice,trust_remote_code)
+        baseline=benchmark_loaded_model(model,tokenizer,inputs,device,max_new_tokens,iterations,False,False)
+        add(2,"Measure baseline","PASS","benchmark_loaded_model(..., use_cache=False, inference_mode=False)",f"E2E={baseline['e2e_ms']:.2f} ms; tok/s={baseline['tokens_per_s']:.2f}","Establish the before value.","The model remains loaded so this phase avoids a second checkpoint load and large RAM spike.","Before measurement","Measure B60 baseline locally.","Measure B70 baseline locally.","Each device needs its own baseline.")
+        optimized=benchmark_loaded_model(model,tokenizer,inputs,device,max_new_tokens,iterations,True,True)
+        add(3,"Measure candidate optimization","PASS","benchmark_loaded_model(..., use_cache=True, inference_mode=True)",f"E2E={optimized['e2e_ms']:.2f} ms; tok/s={optimized['tokens_per_s']:.2f}","Measure the exact same workload after the tuning change.","KV cache trades memory for less repeated attention compute; inference_mode reduces autograd overhead.","KV cache + inference mode","B60 has less memory headroom for cache.","B70 has more cache headroom.","The speed/memory tradeoff differs by device.")
+        speedup=baseline['e2e_ms']/optimized['e2e_ms'] if optimized['e2e_ms'] else 0.0
+        gain=(baseline['e2e_ms']-optimized['e2e_ms'])/baseline['e2e_ms']*100 if baseline['e2e_ms'] else 0.0
+        tgain=(optimized['tokens_per_s']-baseline['tokens_per_s'])/baseline['tokens_per_s']*100 if baseline['tokens_per_s'] else 0.0
         parity=normalize_text(baseline['output'])==normalize_text(optimized['output'])
-        result['summary']={"baseline_e2e_ms":baseline['e2e_ms'],"optimized_e2e_ms":optimized['e2e_ms'],
-            "speedup":speedup,"latency_improvement_pct":improvement,"throughput_gain_pct":throughput_gain,
-            "output_parity":parity,"baseline_tok_s":baseline['tokens_per_s'],"optimized_tok_s":optimized['tokens_per_s']}
+        result['summary']={"speedup":speedup,"latency_improvement_pct":gain,"throughput_gain_pct":tgain,"output_parity":parity,"baseline_e2e_ms":baseline['e2e_ms'],"optimized_e2e_ms":optimized['e2e_ms'],"baseline_tok_s":baseline['tokens_per_s'],"optimized_tok_s":optimized['tokens_per_s'],"hosted_safe_mode":optimized.get('hosted_safe_mode',False)}
         result['samples']=[f"Baseline output: {baseline['output']}",f"Optimized output: {optimized['output']}"]
-        add(4,"Calculate optimization delta","PASS","speedup = baseline_latency / optimized_latency",
-            f"speedup={speedup:.3f}x; latency_change={improvement:.2f}%; throughput_change={throughput_gain:.2f}%",
-            "Quantify whether the candidate actually improved the chosen workload.",
-            "Optimization is a measured delta, not a feature checkbox.",
-            "Optimization effectiveness",
-            "B60 may see different gains because cache pressure and compute balance differ.","B70 may sustain larger cache/context more comfortably.",
-            "Optimization benefit is workload- and hardware-dependent.")
-        add(5,"Verify functional parity after optimization","PASS" if parity else "WARN",
-            "normalize(baseline_output) == normalize(optimized_output)",f"output_parity={parity}",
-            "Ensure speed improvements did not obviously change deterministic functional behavior.",
-            "An optimization is not acceptable if it materially changes expected output for a deterministic test without justification.",
-            "Performance-vs-correctness trade-off",
-            "Check parity on B60 after tuning.","Check parity on B70 after tuning.",
-            "Faster is useful only when behavior remains acceptable.")
-        verdict=parity and improvement>0
-        result['output']=f"Optimization verdict={'PASS' if verdict else 'NO-GAIN/WARN'} | speedup={speedup:.3f}x | latency improvement={improvement:.2f}%"
-        add(6,"Apply Phase 6 optimization verdict","PASS" if verdict else "WARN",
-            "PASS if measured gain > 0 and functional parity remains acceptable",result['output'],
-            "Decide whether the optimization is worth carrying forward.",
-            "Negative or negligible gains should not be promoted simply because an optimization technique is theoretically popular.",
-            "Optimization qualification",
-            "Promote only B60 configurations with measured B60 benefit.","Promote only B70 configurations with measured B70 benefit.",
-            "Tuning must be validated per device and workload.")
+        add(4,"Calculate before/after delta","PASS","speedup = baseline / candidate",f"speedup={speedup:.3f}x; latency gain={gain:.2f}%; throughput gain={tgain:.2f}%","Decide if the optimization produced measurable value.","On noisy shared CPU hosts small negative/positive changes should be treated cautiously.","Optimization effectiveness","Validate gain on B60.","Validate gain on B70.","Optimization is workload- and hardware-specific.")
+        status="PASS" if parity and gain>0 else "WARN"
+        result['output']=f"Optimization verdict={'PASS' if status=='PASS' else 'NO CLEAR GAIN / WARN'} | speedup={speedup:.3f}x | output parity={parity}"
+        add(5,"Apply optimization verdict",status,"require parity; prefer measured positive gain",result['output'],"Keep only optimizations that preserve behavior and show evidence of benefit.","A WARN is not an app error; it means the candidate did not clearly improve this noisy/small workload.","Optimization qualification","Promote only proven B60 gains.","Promote only proven B70 gains.","Theoretically good tuning can be neutral or worse on a given workload.")
         return result
     except Exception as e:
-        result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc()
-        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
-        add(len(result['steps'])+1,"Failure captured","FAIL","exception handler",result['error'],
-            "Capture optimization failure evidence.","This shows whether the baseline or optimized path caused the issue.",
-            "Optimization debugging","Classify B60 tuning failure.","Classify B70 tuning failure.","Same method; memory/capacity can alter results.")
-        return result
+        result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc(); add(len(result['steps'])+1,"Optimization could not complete","FAIL","exception handler",result['error'],"Return a diagnostic instead of a stuck spinner.","The exact baseline/candidate stage remains visible in the completed steps.","Optimization debugging","Check B60 setup/resources.","Check B70 setup/resources.","Failures can be backend- or capacity-specific."); return result
+    finally:
+        try: del inputs,model,tokenizer
+        except Exception: pass
+        gc.collect(); cleanup_accelerator(device)
 
 # -----------------------------
 # Phase 7: regression
 # -----------------------------
 def run_phase7_regression(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,baseline,trust_remote_code=False,threshold_pct=10.0):
     result={"steps":[],"output":"","samples":[],"error":None,"traceback":None,"summary":{}}
-    def add(n,name,status,cmd,out,purpose,behind,concept,b60,b70,why):
-        result['steps'].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,
-            "purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
+    def add(n,name,status,cmd,out,purpose,behind,concept,b60,b70,why): result['steps'].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,"purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
+    if not baseline:
+        result['summary']={'mode':'prerequisite_missing'}; result['output']='Regression not run: no Phase 5 baseline is available.'
+        add(1,"Check baseline prerequisite","SKIPPED","require saved Phase 5 baseline",result['output'],"Avoid an invalid regression comparison.","A regression delta has no meaning without a known-good reference.","Regression prerequisite","Need a B60 baseline.","Need a B70 baseline.","Baseline is a prerequisite, not a runtime error."); return result
     try:
-        if not baseline:
-            raise ValueError("No regression baseline is available. Run Phase 5 and save it as the baseline first.")
-        signature = baseline.get("baseline_signature", {})
-        current_signature = {
-            "model_id": model_id,
-            "prompt": prompt,
-            "max_new_tokens": max_new_tokens,
-            "device": resolve_device(prefer_device),
-            "requested_device": prefer_device,
-            "dtype_choice": dtype_choice,
-            "benchmark_engine": "quick_benchmark_v8",
-            "use_cache": True,
-            "use_inference_mode": True,
-        }
-        mismatches = [k for k in current_signature if signature and signature.get(k) != current_signature.get(k)]
+        signature=baseline.get('baseline_signature',{})
+        current={"model_id":model_id,"prompt":prompt,"max_new_tokens":max_new_tokens,"device":resolve_device(prefer_device),"requested_device":prefer_device,"dtype_choice":dtype_choice,"benchmark_engine":"quick_benchmark_v9","use_cache":True,"use_inference_mode":True}
+        mismatches=[k for k,v in current.items() if signature and signature.get(k)!=v]
         if mismatches:
-            raise ValueError("Regression workload/config does not match saved baseline: " + ", ".join(mismatches))
-        add(1,"Load known-good baseline","PASS","baseline = saved_phase5_metrics",
-            f"baseline_e2e={baseline['e2e_ms']:.2f} ms; baseline_tok/s={baseline['tokens_per_s']:.2f}; threshold={threshold_pct:.1f}%",
-            "Anchor regression decisions to a previously accepted measurement.",
-            "Regression testing asks whether a new software/model/runtime change made established behavior worse.",
-            "Known-good baseline",
-            "Use a B60-specific baseline for B60 regression.","Use a B70-specific baseline for B70 regression.",
-            "Cross-device baselines would confuse hardware differences with regressions.")
-        current=quick_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code,2,True,True)
-        add(2,"Run current candidate","PASS","quick_benchmark(current build/config)",
-            f"current_e2e={current['e2e_ms']:.2f} ms; current_tok/s={current['tokens_per_s']:.2f}",
-            "Measure the new candidate under the same benchmark definition.",
-            "The workload must stay fixed so changes can be attributed to the candidate rather than test drift.",
-            "Candidate regression run",
-            "Run candidate on same B60 SKU/config as baseline.","Run candidate on same B70 SKU/config as baseline.",
-            "Regression comparisons require equivalent test environments.")
-        latency_delta=(current['e2e_ms']-baseline['e2e_ms'])/baseline['e2e_ms']*100 if baseline['e2e_ms'] else 0
-        throughput_delta=(current['tokens_per_s']-baseline['tokens_per_s'])/baseline['tokens_per_s']*100 if baseline['tokens_per_s'] else 0
-        output_parity=normalize_text(current['output'])==normalize_text(baseline.get('output',''))
-        add(3,"Compare latency regression","PASS" if latency_delta<=threshold_pct else "FAIL",
-            "latency_delta% = (current-baseline)/baseline × 100",f"latency_delta={latency_delta:.2f}%",
-            "Detect whether user-visible latency became materially worse.",
-            "A positive latency delta means the current build is slower; the threshold defines acceptable noise/tolerance.",
-            "Performance regression threshold",
-            "Apply the same threshold to B60 baseline/candidate.","Apply the same threshold to B70 baseline/candidate.",
-            "Threshold semantics are the same, but baseline values are device-specific.")
-        add(4,"Compare throughput regression","PASS" if throughput_delta>=-threshold_pct else "FAIL",
-            "throughput_delta% = (current-baseline)/baseline × 100",f"throughput_delta={throughput_delta:.2f}%",
-            "Detect whether generated-token throughput degraded materially.",
-            "Negative throughput delta means less work is completed per second than the accepted baseline.",
-            "Throughput regression",
-            "Use B60 throughput baseline.","Use B70 throughput baseline.",
-            "Do not compare raw B60 throughput against B70 and call the difference a regression.")
-        add(5,"Check functional output regression","PASS" if output_parity else "WARN",
-            "normalize(current_output) == normalize(baseline_output)",f"output_parity={output_parity}",
-            "Catch obvious behavior changes while checking performance regressions.",
-            "Performance improvements or regressions should not silently mask a functional behavior change.",
-            "Functional regression guard",
-            "Same deterministic guard on B60.","Same deterministic guard on B70.",
-            "The correctness guard is independent of device speed.")
-        pass_gate=latency_delta<=threshold_pct and throughput_delta>=-threshold_pct and output_parity
-        result['summary']={"latency_delta_pct":latency_delta,"throughput_delta_pct":throughput_delta,
-            "output_parity":output_parity,"threshold_pct":threshold_pct,"current_e2e_ms":current['e2e_ms'],
-            "current_tok_s":current['tokens_per_s']}
-        result['samples']=[f"Baseline output: {baseline.get('output','')}",f"Current output: {current['output']}"]
-        result['output']=f"Regression verdict={'PASS' if pass_gate else 'FAIL/WARN'} | latency={latency_delta:.2f}% | throughput={throughput_delta:.2f}%"
-        add(6,"Apply Phase 7 regression verdict","PASS" if pass_gate else "FAIL",
-            "PASS if latency and throughput stay within threshold and output parity remains acceptable",result['output'],
-            "Stop bad changes from being promoted to later release stages.",
-            "Regression is the automated guardrail that preserves known-good behavior over time.",
-            "Release gate / regression automation",
-            "Block B60 release when B60 regression gate fails.","Block B70 release when B70 regression gate fails.",
-            "Each platform needs its own known-good reference and gate.")
-        return result
+            result['summary']={'mode':'baseline_mismatch','mismatches':mismatches}; result['output']='Regression skipped because the candidate workload differs from the saved baseline: '+', '.join(mismatches)
+            add(1,"Validate baseline signature","SKIPPED","compare candidate signature to baseline",result['output'],"Prevent misleading regression percentages.","Model/prompt/tokens/device/dtype/benchmark method must match.","Regression test validity","B60 baseline must match B60 candidate.","B70 baseline must match B70 candidate.","A mismatch is a test-definition problem, not a model failure."); return result
+        add(1,"Load known-good baseline","PASS","baseline = Phase 5 metrics",f"baseline E2E={baseline['e2e_ms']:.2f} ms; tok/s={baseline['tokens_per_s']:.2f}; threshold={threshold_pct:.1f}%","Anchor the comparison to accepted evidence.","The baseline contains the workload signature as well as performance metrics.","Known-good baseline","Use B60 baseline for B60.","Use B70 baseline for B70.","Cross-device deltas are not regressions.")
+        current_bm=quick_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code,2,True,True)
+        lat=(current_bm['e2e_ms']-baseline['e2e_ms'])/baseline['e2e_ms']*100 if baseline['e2e_ms'] else 0.0
+        thr=(current_bm['tokens_per_s']-baseline['tokens_per_s'])/baseline['tokens_per_s']*100 if baseline['tokens_per_s'] else 0.0
+        parity=normalize_text(current_bm['output'])==normalize_text(baseline.get('output',''))
+        pass_gate=lat<=threshold_pct and thr>=-threshold_pct and parity
+        result['summary']={"mode":"real_regression","latency_delta_pct":lat,"throughput_delta_pct":thr,"output_parity":parity,"threshold_pct":threshold_pct,"current_e2e_ms":current_bm['e2e_ms'],"current_tok_s":current_bm['tokens_per_s']}
+        result['samples']=[f"Baseline output: {baseline.get('output','')}",f"Current output: {current_bm['output']}"]
+        add(2,"Run candidate with the same benchmark engine","PASS","quick_benchmark_v9(candidate)",f"current E2E={current_bm['e2e_ms']:.2f} ms; tok/s={current_bm['tokens_per_s']:.2f}","Measure the candidate using the same methodology.","The shared benchmark engine prevents measurement-method drift between phases.","Candidate regression run","Same B60 config.","Same B70 config.","Equivalent environments are essential.")
+        add(3,"Compare against threshold","PASS" if pass_gate else "FAIL","latency Δ + throughput Δ + output parity",f"latency Δ={lat:.2f}%; throughput Δ={thr:.2f}%; output parity={parity}","Turn performance evidence into a release guardrail.","A threshold tolerates normal noise but blocks material deterioration.","Regression gate","Apply B60 threshold to B60.","Apply B70 threshold to B70.","Threshold semantics match; baselines are device-specific.")
+        result['output']=f"Regression verdict={'PASS' if pass_gate else 'FAIL'} | latency={lat:.2f}% | throughput={thr:.2f}% | parity={parity}"
+        add(4,"Apply regression verdict","PASS" if pass_gate else "FAIL","release only when within threshold",result['output'],"Protect known-good behavior over time.","A true FAIL here is evidence of a candidate regression, not an app crash.","Release safety gate","Block B60 candidate on failure.","Block B70 candidate on failure.","Each platform needs its own accepted baseline."); return result
     except Exception as e:
-        result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc()
-        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
-        add(len(result['steps'])+1,"Failure captured","FAIL","exception handler",result['error'],
-            "Capture regression-pipeline failure evidence.","A missing baseline or failed candidate run is itself a release-process problem.",
-            "Regression pipeline reliability","Fix B60 baseline/pipeline evidence.","Fix B70 baseline/pipeline evidence.","Release gates need reproducible baselines.")
-        return result
+        result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc(); add(len(result['steps'])+1,"Regression execution could not complete","FAIL","exception handler",result['error'],"Return actionable diagnostics.","The test itself failed to execute; this is different from a measured performance regression.","Pipeline reliability","Check B60 pipeline.","Check B70 pipeline.","Execution errors and regression failures should not be conflated."); return result
 
 # -----------------------------
 # Phase 8: production qualification
 # -----------------------------
-def run_phase8_production_qualification(evidence, max_e2e_ms=5000.0, min_tok_s=1.0):
+def run_phase8_production_qualification(evidence,max_e2e_ms=5000.0,min_tok_s=1.0):
     result={"steps":[],"output":"","error":None,"traceback":None,"summary":{}}
-    def add(n,name,status,cmd,out,purpose,behind,concept,b60,b70,why):
-        result['steps'].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,
-            "purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
+    def add(n,name,status,cmd,out,purpose,behind,concept,b60,b70,why): result['steps'].append({"number":n,"name":name,"status":status,"command":cmd,"output":out,"purpose":purpose,"behind_scenes":behind,"concept":concept,"b60":b60,"b70":b70,"why_diff":why})
     try:
-        phase2=evidence.get('phase2'); phase3=evidence.get('phase3'); phase4=evidence.get('phase4')
-        phase5=evidence.get('phase5'); phase6=evidence.get('phase6'); phase7=evidence.get('phase7'); preflight=evidence.get('preflight')
-        complete=all(x is not None for x in [preflight,phase2,phase3,phase4,phase5,phase6,phase7])
-        add(1,"Verify evidence completeness","PASS" if complete else "FAIL","require phases 0,2,3,4,5,6,7",
-            f"evidence_complete={complete}","Ensure production decisions are based on the full qualification chain.",
-            "Production readiness is cumulative; a missing upstream phase creates an unverified risk.",
-            "Evidence chain / release governance","Require full B60 evidence chain.","Require full B70 evidence chain.","Production qualification must be device-specific and traceable.")
-        pf_ok=bool(preflight and preflight.get('ready'))
-        p2_ok=bool(phase2 and phase2.get('steps') and phase2['steps'][-1]['status']=='PASS')
-        p3_ok=bool(phase3 and phase3.get('steps') and phase3['steps'][-1]['status'] in ['PASS','WARN'])
-        p4_mode=(phase4 or {}).get('summary',{}).get('mode')
-        p4_real = p4_mode == 'real_backend_parity'
-        p4_status = phase4['steps'][-1]['status'] if phase4 and phase4.get('steps') else None
-        p4_ok=bool(p4_real and p4_status in ['PASS','WARN'])
-        add(2,"Check functional + qualification gates","PASS" if pf_ok and p2_ok and p3_ok and p4_ok else "FAIL",
-            "preflight && functional && robustness && REAL backend parity",
-            f"preflight={pf_ok}; phase2={p2_ok}; phase3={p3_ok}; phase4_real={p4_real}; phase4_pass={p4_ok}",
-            "Confirm the model is compatible, functional, stable enough and validated against a distinct target backend.",
-            "A CPU-only parity dry-run is educational evidence, not accelerator qualification; production must fail closed until real backend parity exists.",
-            "Multi-dimensional readiness","Apply same gate chain on B60.","Apply same gate chain on B70.","Different hardware still needs the same logical quality gates.")
-        p5s=(phase5 or {}).get('summary',{})
-        perf_ok=bool(p5s) and p5s.get('e2e_ms',1e99)<=max_e2e_ms and p5s.get('tokens_per_s',0)>=min_tok_s
-        add(3,"Check performance SLO gate","PASS" if perf_ok else "FAIL",
-            "e2e_ms <= SLO && tokens_per_s >= minimum",
-            f"e2e={p5s.get('e2e_ms','—')} ms vs SLO={max_e2e_ms:.0f} ms; tok/s={p5s.get('tokens_per_s','—')} vs min={min_tok_s}",
-            "Translate raw benchmark metrics into an explicit service acceptance criterion.",
-            "A metric only becomes operationally useful when tied to a target/SLO.",
-            "Performance SLO / acceptance criteria","Define B60 SLO based on intended B60 use case.","Define B70 SLO based on intended B70 use case.","Targets may differ by product tier even though the concept is the same.")
-        p7ok=bool(phase7 and phase7.get('steps') and phase7['steps'][-1]['status']=='PASS')
-        add(4,"Check regression release gate","PASS" if p7ok else "FAIL","require Phase 7 PASS",f"regression_gate={p7ok}",
-            "Ensure the current candidate has not materially regressed against the known-good baseline.",
-            "Production release should fail closed when regression evidence is bad or missing.",
-            "Release safety gate","Require B60 regression PASS before B60 promotion.","Require B70 regression PASS before B70 promotion.","Each SKU needs its own baseline and release evidence.")
-        resource_ok=True
-        mem=(p5s.get('memory','') if p5s else '')
-        add(5,"Review resource headroom","PASS" if resource_ok else "WARN","review benchmark memory evidence",mem or "No memory evidence captured",
-            "Confirm the deployment is not operating at an obviously fragile capacity edge.",
-            "Healthy headroom reduces out-of-memory and burst-risk during real traffic.",
-            "Capacity planning / headroom","B60's 24 GB makes headroom especially important.","B70's 32 GB provides more room but still needs capacity planning.","More memory reduces risk but does not eliminate the need for headroom checks.")
-        reproducible=bool(phase5 and phase5.get('summary'))
-        add(6,"Verify reproducibility metadata","PASS" if reproducible else "FAIL","capture model_id, dtype, device, workload, metrics",
-            f"model/workload evidence captured={reproducible}","Make the production qualification repeatable by another engineer/team.",
-            "A production PASS without reproducible settings is difficult to audit or debug.",
-            "Reproducibility / auditability","Capture B60 device/runtime identity.","Capture B70 device/runtime identity.","Device identity and software versions are part of the production artifact.")
-        final=complete and pf_ok and p2_ok and p3_ok and p4_ok and perf_ok and p7ok and reproducible
-        result['summary']={"ready":final,"preflight":pf_ok,"functional":p2_ok,"qualification":p3_ok,
-            "parity":p4_ok,"parity_mode":p4_mode,"performance_slo":perf_ok,"regression":p7ok,"reproducible":reproducible}
-        result['output']=f"Production qualification={'PASS' if final else 'NOT READY'}"
-        add(7,"Apply Phase 8 production verdict","PASS" if final else "FAIL",
-            "PASS only if all required evidence gates pass",result['output'],
-            "Produce a final go/no-go readiness decision for this model/backend/workload combination.",
-            "Production qualification aggregates functional, robustness, correctness, performance, regression and reproducibility evidence.",
-            "Production readiness / go-no-go","PASS is specific to the tested B60 configuration and workload.","PASS is specific to the tested B70 configuration and workload.","A production PASS is never universal; it is scoped to a model, stack, hardware and workload.")
-        return result
+        pf=evidence.get('preflight'); p2=evidence.get('phase2'); p3=evidence.get('phase3'); p4=evidence.get('phase4'); p5=evidence.get('phase5'); p6=evidence.get('phase6'); p7=evidence.get('phase7')
+        missing=[name for name,obj in [('Preflight',pf),('Functional',p2),('Qualification',p3),('Parity',p4),('Benchmark',p5),('Optimization',p6),('Regression',p7)] if obj is None]
+        add(1,"Check evidence completeness","PASS" if not missing else "WARN","collect phases 0–7", "All required evidence is present." if not missing else "Missing: "+', '.join(missing),"Show whether a production decision is even possible.","Missing evidence yields NOT READY rather than a Python exception.","Evidence chain","Require B60 evidence chain.","Require B70 evidence chain.","Production qualification should fail closed but remain user-friendly.")
+        pf_ok=bool(pf and pf.get('ready')); p2_ok=bool(p2 and p2.get('steps') and p2['steps'][-1]['status']=='PASS'); p3_ok=bool(p3 and p3.get('steps') and p3['steps'][-1]['status'] in ['PASS','WARN'])
+        p4_mode=(p4 or {}).get('summary',{}).get('mode'); p4_status=p4['steps'][-1]['status'] if p4 and p4.get('steps') else None; p4_ok=bool(p4_mode=='real_backend_parity' and p4_status in ['PASS','WARN'])
+        add(2,"Validate functional + real parity gates","PASS" if pf_ok and p2_ok and p3_ok and p4_ok else "WARN", "preflight + functional + robustness + real backend parity",f"preflight={pf_ok}; functional={p2_ok}; robustness={p3_ok}; parity_mode={p4_mode}; real_parity={p4_ok}","Confirm correctness evidence exists before production promotion.","On CPU-only Streamlit Cloud, Phase 4 is intentionally SKIPPED; therefore accelerator production qualification stays NOT READY without throwing an error.","Scoped production evidence","Need real CPU-vs-B60 parity for B60.","Need real CPU-vs-B70 parity for B70.","A hosted demo can be healthy without being accelerator-qualified.")
+        p5s=(p5 or {}).get('summary',{}); perf_ok=bool(p5s and p5s.get('e2e_ms') is not None and p5s.get('tokens_per_s') is not None and p5s.get('e2e_ms')<=max_e2e_ms and p5s.get('tokens_per_s')>=min_tok_s)
+        add(3,"Check performance SLO","PASS" if perf_ok else "WARN","E2E <= SLO and tok/s >= minimum",f"E2E={p5s.get('e2e_ms','—')} ms; SLO={max_e2e_ms:.0f} ms; throughput={p5s.get('tokens_per_s','—')}; minimum={min_tok_s}","Translate benchmark numbers into acceptance criteria.","A benchmark result alone is descriptive; an SLO makes it actionable.","Performance acceptance","Set B60 SLO for B60 product needs.","Set B70 SLO for B70 product needs.","Different product tiers may use different targets.")
+        p7_mode=(p7 or {}).get('summary',{}).get('mode'); p7_ok=bool(p7 and p7.get('steps') and p7['steps'][-1]['status']=='PASS' and p7_mode=='real_regression')
+        add(4,"Check regression gate","PASS" if p7_ok else "WARN","require real Phase 7 PASS",f"regression_mode={p7_mode}; pass={p7_ok}","Ensure the candidate did not regress against an accepted baseline.","Missing/mismatched baseline is shown as prerequisite work, not as an app error.","Release guardrail","B60 needs a B60 baseline.","B70 needs a B70 baseline.","Release evidence is platform-specific.")
+        complete=not missing; final=complete and pf_ok and p2_ok and p3_ok and p4_ok and perf_ok and p7_ok
+        demo_ready=pf_ok and p2_ok and p3_ok and bool(p5s)
+        result['summary']={"ready":final,"demo_ready":demo_ready,"missing":missing,"preflight":pf_ok,"functional":p2_ok,"qualification":p3_ok,"parity":p4_ok,"parity_mode":p4_mode,"performance_slo":perf_ok,"regression":p7_ok}
+        if final: status='PASS'; result['output']='Production qualification=PASS for this tested model/backend/workload.'
+        else: status='WARN'; result['output']='Production qualification=NOT READY. The app may still be suitable as a CPU-hosted learning/demo environment; review the missing/blocked gates above.'
+        add(5,"Apply scoped production verdict",status,"aggregate required evidence gates",result['output'],"Give a go/no-go decision without confusing missing accelerator evidence with a software crash.","Production PASS is intentionally strict; hosted demo readiness is a separate concept.","Production readiness / go-no-go","PASS applies only to tested B60 config.","PASS applies only to tested B70 config.","Readiness is scoped to model + stack + hardware + workload."); return result
     except Exception as e:
-        result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc()
-        cleanup_accelerator(locals().get("device", locals().get("target_device", None)))
-        add(len(result['steps'])+1,"Failure captured","FAIL","exception handler",result['error'],
-            "Capture production-qualification pipeline failure.","Missing evidence or aggregation failures must block release until resolved.",
-            "Production gate reliability","Block B60 promotion.","Block B70 promotion.","A broken release gate is itself a production risk.")
-        return result
+        result['error']=f"{type(e).__name__}: {e}"; result['traceback']=traceback.format_exc(); add(len(result['steps'])+1,"Production aggregation could not complete","FAIL","exception handler",result['error'],"Expose aggregation bugs rather than silently claiming readiness.","This is an app/pipeline error, not a production verdict.","Gate reliability","Block B60 promotion.","Block B70 promotion.","A broken qualification gate is itself a risk."); return result
 
 COMPARISON = [
     {"Step": "Preflight: software compatibility", "Generic / local step": "Check Python, torch, Transformers, disk/RAM and model-repo access.", "Intel Arc Pro B70 step": "Do the same plus require a working XPU build/runtime.", "Why different": "B70 depends on the Intel XPU path in addition to normal Python/model compatibility."},
@@ -1696,9 +1445,9 @@ COMPARISON = [
 # -----------------------------
 st.title("✅ Hugging Face Model Functional Verifier")
 st.write(
-    "A lightweight functional checker with a **preflight gate**, a transparent **single-run functional tab**, "
-    "covering the complete lightweight path from preflight through production qualification, with a shared benchmark engine, strict regression baselines, and explicit PASS/WARN/FAIL/SKIPPED semantics."
+    "A lightweight, TPM-friendly model qualification lab from setup compatibility through production gates."
 )
+st.info("🧭 **Recommended order:** Preflight → Functional → Qualification → Parity → Benchmark → Optimization → Regression → Production → Summary.  ✅ PASS = gate met · ⚠️ WARN = review evidence · ⏭️ SKIPPED = prerequisite/not applicable · ❌ FAIL = execution or gate failure.")
 
 with st.sidebar:
     st.header("Input")
@@ -1731,7 +1480,8 @@ tabs = st.tabs([
 ])
 
 with tabs[0]:
-    st.subheader("Setup compatibility preflight")
+    st.subheader("🩺 Setup compatibility preflight")
+    tab_note("🎯","Goal","Catch environment/dependency/device problems before loading the model.")
     st.write("Run this first. **HARD FAIL** blocks later phases; **WARN** means the setup may still work but deserves attention.")
     if st.button("🔎 Run preflight", type="primary", width="stretch"):
         with st.spinner("Checking setup compatibility..."):
@@ -1747,8 +1497,11 @@ with tabs[0]:
             st.subheader("Fix first")
             for item in hard_fails: st.write(f"• **{item['Check']}** — {item['Detail']}")
 
+    assumptions_box(["Preflight checks setup compatibility; it does not prove the model itself is functional.", "Community Cloud is resource-constrained and normally CPU-only; XPU checks require a B60/B70 host.", "Disk/RAM checks are conservative heuristics, not formal capacity guarantees."])
+
 with tabs[1]:
-    st.subheader("Phase 2 — functional smoke test · TPM transparent mode")
+    st.subheader("✅ Phase 2 — functional smoke test · TPM transparent mode")
+    tab_note("🎯","Goal","Prove one end-to-end model inference works and show what happens internally.")
     pf=st.session_state.get("preflight"); ready=bool(pf and pf.get("ready"))
     if not pf: st.warning("Run **0 · Preflight** first.")
     elif not ready: st.error("Functional verification is blocked because preflight has a HARD FAIL.")
@@ -1764,8 +1517,11 @@ with tabs[1]:
                  "Generate time":f"{result['generation_seconds']:.2f}s" if result.get("generation_seconds") is not None else "—"}
         render_step_expanders(result,"Final generated output",metrics)
 
+    assumptions_box(["Functional PASS proves one deterministic inference path completed on this exact stack.", "It does not prove repeatability, parity, benchmark performance, or production readiness.", "Auto dtype may switch to FP16 on very small CPU hosts to reduce memory pressure; choose FP32 explicitly if you require it."])
+
 with tabs[2]:
-    st.subheader("Phase 3 — robustness / repeatability qualification")
+    st.subheader("🔁 Phase 3 — robustness / repeatability qualification")
+    tab_note("🎯","Goal","Check that functionality is repeatable across several runs and prompt shapes.")
     pf=st.session_state.get("preflight");ready=bool(pf and pf.get("ready"))
     if not pf: st.warning("Run **0 · Preflight** first.")
     q_prompt=st.text_area("Base prompt for qualification",value="Explain in one short sentence what inference means in AI.",height=90,key="phase3_prompt")
@@ -1780,8 +1536,11 @@ with tabs[2]:
         sm=result.get("summary",{})
         render_step_expanders(result,"Phase 3 verdict",{"Device":result.get("device") or "—","Dtype":result.get("dtype") or "—","Pass rate":f"{sm.get('pass_rate',0):.2%}","Deterministic":str(sm.get('deterministic','—'))})
 
+    assumptions_box(["Phase 3 is intentionally lightweight; it is not an exhaustive stress test.", "Shared-cloud scheduling can cause timing variation even when the model is healthy.", "Long-context factor is a small sanity test, not validation of the model's maximum advertised context window."])
+
 with tabs[3]:
-    st.subheader("Phase 4 — correctness / parity against CPU reference")
+    st.subheader("⚖️ Phase 4 — correctness / parity against CPU reference")
+    tab_note("🎯","Goal","Compare a real target backend against a CPU reference without wasting RAM on CPU-vs-CPU.")
     st.caption(
         "If the selected target resolves to CPU (common on Streamlit Community Cloud), "
         "the app now skips the duplicate CPU-vs-CPU model load to avoid RAM pressure. "
@@ -1797,8 +1556,11 @@ with tabs[3]:
         sm=result.get("summary",{})
         render_step_expanders(result,"Phase 4 verdict",{"Target":result.get("device") or "—","Dtype":result.get("dtype") or "—","Top1 match":str(sm.get('top1_match','—')),"Top5 overlap":str(sm.get('top5_overlap','—'))})
 
+    assumptions_box(["On CPU-only hosts this phase is SKIPPED because CPU-vs-CPU does not validate accelerator parity.", "Real B60/B70 parity requires the app to run on that XPU hardware and software stack.", "Small numerical differences across backends/precisions can be acceptable; bitwise equality is not always required."])
+
 with tabs[4]:
-    st.subheader("Phase 5 — performance benchmark")
+    st.subheader("⏱️ Phase 5 — performance benchmark")
+    tab_note("🎯","Goal","Create a lightweight, reproducible performance baseline for this exact workload.")
     pf=st.session_state.get("preflight");ready=bool(pf and pf.get("ready"))
     b_prompt=st.text_area("Benchmark prompt",value="Explain in two short sentences why KV cache matters during LLM inference.",height=90,key="phase5_prompt")
     iterations=st.slider("Measured iterations",2,5,3,1,key="phase5_iters")
@@ -1810,14 +1572,17 @@ with tabs[4]:
     if result:
         sm=result.get("summary",{})
         render_step_expanders(result,"Phase 5 benchmark baseline",{
-            "Prefill":f"{sm.get('prefill_ms',0):.1f} ms","TTFT proxy":f"{sm.get('ttft_proxy_ms',0):.1f} ms",
-            "TPOT~":f"{sm.get('approx_tpot_ms',0):.1f} ms/tok","Tokens/s":f"{sm.get('tokens_per_s',0):.2f}"})
-        if sm and st.button("💾 Save Phase 5 result as regression baseline"):
+            "Prefill":fmt_metric(sm.get('prefill_ms')," ms",1),"TTFT proxy":fmt_metric(sm.get('ttft_proxy_ms')," ms",1),
+            "TPOT~":fmt_metric(sm.get('approx_tpot_ms')," ms/tok",1),"Tokens/s":fmt_metric(sm.get('tokens_per_s'),"",2)})
+        if sm and result.get("steps") and result["steps"][-1]["status"]=="PASS":
             st.session_state["regression_baseline"]=dict(sm)
-            st.success("Saved current Phase 5 metrics/output as regression baseline for Phase 7.")
+            st.success("💾 This successful Phase 5 result was automatically saved as the Phase 7 regression baseline.")
+
+    assumptions_box(["TTFT and TPOT shown here are educational proxies because this is not a streaming production server.", "On low-memory CPU hosts the separate prefill forward is replaced by a proxy to avoid RAM spikes.", "Community Cloud benchmark numbers are learning/demo evidence, not vendor-grade accelerator benchmark results."])
 
 with tabs[5]:
-    st.subheader("Phase 6 — optimization / tuning")
+    st.subheader("⚙️ Phase 6 — optimization / tuning")
+    tab_note("🎯","Goal","Measure whether one controlled optimization actually helps without changing output.")
     pf=st.session_state.get("preflight");ready=bool(pf and pf.get("ready"))
     o_prompt=st.text_area("Optimization comparison prompt",value="Explain in one short sentence what a KV cache stores.",height=90,key="phase6_prompt")
     opt_iters=st.slider("Iterations per baseline/candidate",1,3,2,1,key="phase6_iters")
@@ -1832,8 +1597,11 @@ with tabs[5]:
             "Speedup":f"{sm.get('speedup',0):.3f}x","Latency gain":f"{sm.get('latency_improvement_pct',0):.1f}%",
             "Throughput gain":f"{sm.get('throughput_gain_pct',0):.1f}%","Output parity":str(sm.get('output_parity','—'))})
 
+    assumptions_box(["A WARN means the optimization produced no clear gain; it is not necessarily an app error.", "Phase 6 now loads the model only once and compares both configurations in the same session to reduce memory pressure.", "Optimization gains must be revalidated on the actual B60/B70 target hardware."])
+
 with tabs[6]:
-    st.subheader("Phase 7 — regression gate")
+    st.subheader("🛡️ Phase 7 — regression gate")
+    tab_note("🎯","Goal","Compare the current candidate against the automatically saved known-good Phase 5 baseline.")
     pf=st.session_state.get("preflight");ready=bool(pf and pf.get("ready"))
     baseline=st.session_state.get("regression_baseline")
     if not baseline:
@@ -1842,7 +1610,8 @@ with tabs[6]:
             st.info("A Phase 5 result exists. Save it as the regression baseline from the Phase 5 tab before running this phase.")
         else:
             st.warning("Run Phase 5 first and save its result as the regression baseline.")
-    r_prompt=st.text_area("Regression workload prompt",value="Explain in two short sentences why KV cache matters during LLM inference.",height=90,key="phase7_prompt")
+    r_prompt=(baseline or {}).get("baseline_signature",{}).get("prompt", "Explain in two short sentences why KV cache matters during LLM inference.")
+    st.text_area("Regression workload prompt (locked to baseline)",value=r_prompt,height=90,key="phase7_prompt_display",disabled=True)
     threshold=st.slider("Allowed regression threshold (%)",1.0,30.0,10.0,1.0)
     if st.button("▶ Run Phase 7 regression",width="stretch",disabled=not (ready and baseline)):
         with st.spinner("Comparing current candidate against baseline..."):
@@ -1854,8 +1623,11 @@ with tabs[6]:
             "Latency Δ":f"{sm.get('latency_delta_pct',0):.1f}%","Throughput Δ":f"{sm.get('throughput_delta_pct',0):.1f}%",
             "Threshold":f"{sm.get('threshold_pct',threshold):.1f}%","Output parity":str(sm.get('output_parity','—'))})
 
+    assumptions_box(["Phase 5 automatically saves a successful regression baseline.", "Regression only makes sense when model, prompt, output length, device, dtype, and benchmark method match the baseline.", "SKIPPED means the comparison definition is invalid or a prerequisite is missing—not that the model regressed."])
+
 with tabs[7]:
-    st.subheader("Phase 8 — production qualification")
+    st.subheader("🚦 Phase 8 — production qualification")
+    tab_note("🎯","Goal","Aggregate all prior evidence into a scoped go/no-go decision—without mistaking missing prerequisites for app errors.")
     max_e2e=st.number_input("Maximum acceptable E2E latency (ms)",min_value=1.0,value=5000.0,step=100.0)
     min_tok=st.number_input("Minimum acceptable generated tokens/sec",min_value=0.1,value=1.0,step=0.5)
     evidence={"preflight":st.session_state.get("preflight"),"phase2":st.session_state.get("phase2_result"),
@@ -1872,17 +1644,26 @@ with tabs[7]:
             "Ready":str(sm.get('ready','—')),"Performance SLO":str(sm.get('performance_slo','—')),
             "Regression":str(sm.get('regression','—')),"Reproducible":str(sm.get('reproducible','—'))})
 
+    assumptions_box(["Production qualification is intentionally fail-closed: missing real accelerator parity keeps accelerator production status NOT READY.", "A CPU-hosted Streamlit deployment can still be healthy as a learning/demo environment.", "Real production readiness also needs serving, concurrency, security, observability, failover, capacity, and operational testing beyond this lightweight app."])
+
 with tabs[8]:
-    st.subheader("Generic vs Intel Arc Pro B70")
+    st.subheader("🧩 Generic vs Intel Arc Pro B70")
+    tab_note("💡","How to read this","The model workflow is mostly the same; device/runtime, memory headroom, and evidence collection differ.")
     st.dataframe(COMPARISON,width="stretch",hide_index=True)
 
+    assumptions_box(["This reference table explains conceptual differences; it does not execute B70 hardware remotely.", "Intel XPU behavior depends on the installed driver/runtime/PyTorch combination."])
+
 with tabs[9]:
-    st.subheader("Current runtime")
+    st.subheader("🖥️ Current runtime")
+    tab_note("💡","Why it matters","Framework, Python, and device versions are part of reproducibility.")
     snap=runtime_snapshot()
     st.dataframe([{"Item":k,"Value":v} for k,v in snap.items()],width="stretch",hide_index=True)
 
+    assumptions_box(["Environment metadata is diagnostic evidence and should be captured alongside benchmark results.", "Hosted environments can change underlying CPU resources over time."])
+
 with tabs[10]:
-    st.subheader("Minimal TPM progression gate")
+    st.subheader("🧭 Minimal TPM progression gate")
+    tab_note("🧠","Remember","Each phase answers a different question; do not jump to optimization before proving the earlier gates.")
     checks=[
         "Phase 0 — Preflight: setup compatibility has no HARD FAIL.",
         "Phase 2 — Functional: tokenizer + model + generation + non-empty output succeed.",
@@ -1895,8 +1676,11 @@ with tabs[10]:
     ]
     for i,item in enumerate(checks,1): st.write(f"**{i}.** {item}")
 
+    assumptions_box(["The checklist is a learning sequence; real organizations may add security, compliance, load, resilience, and serving-specific gates.", "Each phase should have explicit entry/exit criteria before automation in CI/CD."])
+
 with tabs[11]:
-    st.subheader("Executive Summary · TPM implementation map")
+    st.subheader("📊 Executive Summary · TPM implementation map")
+    tab_note("🎯","Goal","Consolidate phase status, key metrics, TPM takeaways, and interview-ready concepts in one view.")
     pf=st.session_state.get("preflight");p2=st.session_state.get("phase2_result");p3=st.session_state.get("phase3_result")
     p4=st.session_state.get("phase4_result");p5=st.session_state.get("phase5_result");p6=st.session_state.get("phase6_result")
     p7=st.session_state.get("phase7_result");p8=st.session_state.get("phase8_result")
@@ -1908,7 +1692,7 @@ with tabs[11]:
             return "PASS" if result.get("ready") else "FAIL"
         if isinstance(result,dict):
             mode = result.get("summary",{}).get("mode")
-            if mode == "educational_skip":
+            if mode in {"educational_skip","prerequisite_missing","baseline_mismatch"}:
                 return "SKIPPED"
         steps=result.get("steps",[]) if isinstance(result,dict) else []
         if not steps:
@@ -1980,6 +1764,8 @@ Production qualification
         ↓
 Only then: scale-out / serving / long-term operations""",language="text")
 
+    assumptions_box(["Summary values are only as trustworthy as the individual phase evidence that produced them.", "SKIPPED parity on CPU-only Streamlit Cloud must not be interpreted as accelerator qualification.", "Dashboard charts combine metrics with different units for learning convenience; use dedicated charts/reports for formal benchmarking."])
+
 st.divider()
-st.caption("This app now covers the complete lightweight path from environment preflight through production qualification. Results are scoped to the tested model, software stack, hardware, precision and workload.")
+st.caption("🧪 Lightweight qualification lab. Results are scoped to the tested model, software stack, hardware, precision and workload; they are not universal vendor performance claims.")
 
