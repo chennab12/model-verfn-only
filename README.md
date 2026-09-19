@@ -97,3 +97,69 @@ If any of these differ, V6 rejects the regression comparison instead of reportin
 ## Phase 4 parity hotfix
 
 On CPU-only hosted environments, Phase 4 now skips duplicate CPU-vs-CPU model loading and returns an educational dry-run verdict. On real CUDA/XPU/MPS hardware, it still performs the full CPU-reference vs target-backend comparison, with aggressive cleanup between model loads.
+
+
+## V8 later-phase reliability fixes
+
+### One shared benchmark engine
+
+Phases 5, 6, and 7 now call the same `quick_benchmark()` implementation.
+
+It performs:
+- warm-up
+- prefill timing
+- one-token TTFT proxy
+- full deterministic generation timing
+- tokens/sec
+- approximate decode tokens/sec
+- approximate TPOT
+- run-to-run latency CV
+- device-memory evidence
+- deterministic output capture
+- mandatory model/tensor cleanup before returning
+
+This prevents Phase 5, 6, and 7 from silently using different measurement methods.
+
+### Phase 3 memory hardening
+
+Repeat and prompt-suite tensors are released after each iteration, and the loaded model is explicitly released before the tab returns.
+
+### Phase 7 baseline validity
+
+The saved baseline signature now includes:
+- model ID
+- prompt
+- max output tokens
+- resolved device
+- requested device
+- dtype choice
+- benchmark engine version
+- KV-cache setting
+- inference-mode setting
+
+A candidate that does not match the baseline definition is rejected rather than compared.
+
+### Phase 8 fail-closed parity logic
+
+A Streamlit Cloud CPU-only Phase 4 dry-run now has mode:
+
+`educational_skip`
+
+Phase 8 does **not** count this as accelerator parity.
+
+Production qualification requires:
+
+`phase4.summary.mode == "real_backend_parity"`
+
+plus an acceptable parity status.
+
+### Summary status semantics
+
+The Summary tab now distinguishes:
+- PASS
+- WARN
+- FAIL
+- SKIPPED
+- NOT RUN
+
+A CPU-only parity dry-run is shown as **SKIPPED**, not PASS.

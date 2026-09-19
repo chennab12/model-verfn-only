@@ -62,3 +62,20 @@ else:
 if failures:
     raise SystemExit('SELF CHECK FAILED: ' + ', '.join(failures))
 print('SELF CHECK PASSED')
+
+
+# V8 structural checks
+source = Path("app.py").read_text(encoding="utf-8")
+required_v8 = [
+    "def quick_benchmark(",
+    "def run_phase5_benchmark(",
+    "def run_phase6_optimization(",
+    "def run_phase7_regression(",
+    "def run_phase8_production_qualification(",
+    '"SKIPPED"',
+    '"educational_skip"',
+]
+missing_v8 = [x for x in required_v8 if x not in source]
+if missing_v8:
+    raise SystemExit("V8 structural check failed; missing: " + ", ".join(missing_v8))
+print("V8 structural checks: PASS")

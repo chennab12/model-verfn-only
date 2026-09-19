@@ -171,6 +171,8 @@ def render_step_expanders(result, output_label="Final generated output", metrics
         st.success("✅ PASS")
     elif final_status == "WARN":
         st.warning("⚠️ WARN — review the evidence below")
+    elif final_status == "SKIPPED":
+        st.info("⏭️ SKIPPED / NOT APPLICABLE")
     else:
         st.error("❌ FAIL")
     if metrics:
@@ -744,6 +746,8 @@ def run_phase3_qualification(model_id, base_prompt, max_new_tokens, prefer_devic
             base_outputs.append(decoded)
             repeat_times.append(elapsed)
             result["samples"].append(f"Repeat {i+1}: {decoded}")
+            del out, new_tokens, inputs
+            gc.collect()
         unique_outputs = len(set(base_outputs))
         deterministic = unique_outputs == 1 and all(x != "" for x in base_outputs)
         add_step(5, "Run deterministic repeatability loop", "PASS" if deterministic else "WARN",
@@ -774,6 +778,8 @@ def run_phase3_qualification(model_id, base_prompt, max_new_tokens, prefer_devic
             new_tokens = out[0][inputs["input_ids"].shape[-1]:]
             decoded = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
             suite_results.append((name, tok_len, bool(decoded), decoded[:120]))
+            del out, new_tokens, inputs
+            gc.collect()
         suite_ok = all(x[2] for x in suite_results)
         suite_summary = "; ".join([f"{n}:tok={t},ok={ok}" for n, t, ok, _ in suite_results])
         add_step(6, "Run prompt-variation stability suite", "PASS" if suite_ok else "WARN",
@@ -1152,6 +1158,213 @@ def run_phase4_parity(model_id, prompt, max_new_tokens, prefer_device, dtype_cho
         })
         return result
 
+
+def quick_benchmark(
+    model_id,
+    prompt,
+    max_new_tokens,
+    prefer_device,
+    dtype_choice,
+    trust_remote_code=False,
+    iterations=3,
+    use_cache=True,
+    use_inference_mode=True,
+):
+    """
+    Shared lightweight benchmark engine for Phases 5/6/7.
+
+    Measures a fixed workload with:
+      - warm-up
+      - prefill latency
+      - one-token TTFT proxy
+      - full end-to-end generation
+      - tokens/sec
+      - approximate TPOT / decode throughput
+      - latency variability
+      - memory evidence
+
+    Always unloads the model before returning so later Streamlit tabs do not
+    accumulate model copies in process memory.
+    """
+    import statistics
+    import torch
+    from transformers import AutoTokenizer
+
+    device = resolve_device(prefer_device)
+    dtype = selected_dtype(device, dtype_choice)
+    tokenizer = None
+    model = None
+    inputs = None
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+        )
+        model = load_causal_model(model_id, dtype, trust_remote_code).to(device)
+
+        messages = [{"role": "user", "content": prompt}]
+        if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+            formatted = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            formatted = prompt
+
+        host_inputs = tokenizer(formatted, return_tensors="pt")
+        input_tokens = int(host_inputs["input_ids"].shape[-1])
+        inputs = {k: v.to(device) for k, v in host_inputs.items()}
+
+        # Warm-up. This is intentionally not included in measurements.
+        with torch.inference_mode() if use_inference_mode else torch.no_grad():
+            _ = deterministic_generate(
+                model,
+                **inputs,
+                max_new_tokens=min(4, max_new_tokens),
+                pad_token_id=tokenizer.eos_token_id,
+                use_cache=use_cache,
+            )
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
+            torch.xpu.synchronize()
+
+        prefill_times = []
+        ttft_proxy_times = []
+        e2e_times = []
+        generated_counts = []
+        outputs = []
+
+        mode_ctx = torch.inference_mode if use_inference_mode else torch.no_grad
+
+        for _i in range(max(1, int(iterations))):
+            # Prefill measurement.
+            t0 = time.perf_counter()
+            with mode_ctx():
+                _prefill = model(**inputs, use_cache=use_cache)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
+                torch.xpu.synchronize()
+            prefill_times.append(time.perf_counter() - t0)
+            del _prefill
+
+            # One-token generation = lightweight TTFT proxy for this non-streaming app.
+            t1 = time.perf_counter()
+            with mode_ctx():
+                one = deterministic_generate(
+                    model,
+                    **inputs,
+                    max_new_tokens=1,
+                    pad_token_id=tokenizer.eos_token_id,
+                    use_cache=use_cache,
+                )
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
+                torch.xpu.synchronize()
+            ttft_proxy_times.append(time.perf_counter() - t1)
+            del one
+
+            # Full deterministic generation.
+            t2 = time.perf_counter()
+            with mode_ctx():
+                out = deterministic_generate(
+                    model,
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=tokenizer.eos_token_id,
+                    use_cache=use_cache,
+                )
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elif device == "xpu" and hasattr(torch.xpu, "synchronize"):
+                torch.xpu.synchronize()
+            elapsed = time.perf_counter() - t2
+            e2e_times.append(elapsed)
+
+            new_tokens = out[0][input_tokens:]
+            count = int(new_tokens.shape[-1])
+            generated_counts.append(count)
+            outputs.append(
+                tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            )
+            del out, new_tokens
+
+        avg_prefill_s = sum(prefill_times) / len(prefill_times)
+        avg_ttft_s = sum(ttft_proxy_times) / len(ttft_proxy_times)
+        avg_e2e_s = sum(e2e_times) / len(e2e_times)
+        avg_output_tokens = sum(generated_counts) / len(generated_counts)
+
+        tokens_per_s = (
+            avg_output_tokens / avg_e2e_s
+            if avg_e2e_s > 0 and avg_output_tokens > 0
+            else 0.0
+        )
+
+        # Approximate decode-only metrics. In this small non-streaming HF path,
+        # subtract prefill from total generation as an educational approximation.
+        approx_decode_s = max(avg_e2e_s - avg_prefill_s, 1e-9)
+        approx_decode_tokens_per_s = (
+            avg_output_tokens / approx_decode_s
+            if avg_output_tokens > 0
+            else 0.0
+        )
+        approx_tpot_ms = (
+            (approx_decode_s / max(avg_output_tokens, 1.0)) * 1000.0
+        )
+
+        mean_e2e = avg_e2e_s
+        if len(e2e_times) >= 2 and mean_e2e > 0:
+            latency_cv_pct = statistics.pstdev(e2e_times) / mean_e2e * 100.0
+        else:
+            latency_cv_pct = 0.0
+
+        # Deterministic output should generally remain stable across measured runs.
+        nonempty_outputs = [o for o in outputs if o]
+        representative_output = nonempty_outputs[-1] if nonempty_outputs else ""
+        unique_output_count = len(set(nonempty_outputs)) if nonempty_outputs else 0
+
+        return {
+            "device": device,
+            "dtype": str(dtype).replace("torch.", ""),
+            "iterations": max(1, int(iterations)),
+            "input_tokens": input_tokens,
+            "avg_output_tokens": avg_output_tokens,
+            "prefill_ms": avg_prefill_s * 1000.0,
+            "ttft_proxy_ms": avg_ttft_s * 1000.0,
+            "e2e_ms": avg_e2e_s * 1000.0,
+            "tokens_per_s": tokens_per_s,
+            "approx_decode_tokens_per_s": approx_decode_tokens_per_s,
+            "approx_tpot_ms": approx_tpot_ms,
+            "latency_cv_pct": latency_cv_pct,
+            "memory": sample_memory_report(device),
+            "output": representative_output,
+            "unique_output_count": unique_output_count,
+            "use_cache": bool(use_cache),
+            "use_inference_mode": bool(use_inference_mode),
+            "raw_e2e_ms": [x * 1000.0 for x in e2e_times],
+        }
+    finally:
+        # Release all model/tensor objects even if a benchmark substep raises.
+        try:
+            del inputs
+        except Exception:
+            pass
+        try:
+            del model
+        except Exception:
+            pass
+        try:
+            del tokenizer
+        except Exception:
+            pass
+        gc.collect()
+        cleanup_accelerator(device)
+
+
 # -----------------------------
 # Phase 5: performance benchmark
 # -----------------------------
@@ -1177,9 +1390,15 @@ def run_phase5_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choi
             "Warm-up reduces one-time runtime noise on either device.")
         bm=quick_benchmark(model_id,prompt,max_new_tokens,prefer_device,dtype_choice,trust_remote_code,iterations,True,True)
         bm["baseline_signature"] = {
-            "model_id": model_id, "prompt": prompt, "max_new_tokens": max_new_tokens,
-            "device": resolve_device(prefer_device), "requested_device": prefer_device,
+            "model_id": model_id,
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "device": resolve_device(prefer_device),
+            "requested_device": prefer_device,
             "dtype_choice": dtype_choice,
+            "benchmark_engine": "quick_benchmark_v8",
+            "use_cache": True,
+            "use_inference_mode": True,
         }
         result["summary"]=bm; result["output"]=bm["output"]
         add(3,"Measure prefill latency","PASS","model(**inputs, use_cache=True)",
@@ -1319,9 +1538,15 @@ def run_phase7_regression(model_id,prompt,max_new_tokens,prefer_device,dtype_cho
             raise ValueError("No regression baseline is available. Run Phase 5 and save it as the baseline first.")
         signature = baseline.get("baseline_signature", {})
         current_signature = {
-            "model_id": model_id, "prompt": prompt, "max_new_tokens": max_new_tokens,
-            "device": resolve_device(prefer_device), "requested_device": prefer_device,
+            "model_id": model_id,
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "device": resolve_device(prefer_device),
+            "requested_device": prefer_device,
             "dtype_choice": dtype_choice,
+            "benchmark_engine": "quick_benchmark_v8",
+            "use_cache": True,
+            "use_inference_mode": True,
         }
         mismatches = [k for k in current_signature if signature and signature.get(k) != current_signature.get(k)]
         if mismatches:
@@ -1406,12 +1631,15 @@ def run_phase8_production_qualification(evidence, max_e2e_ms=5000.0, min_tok_s=1
         pf_ok=bool(preflight and preflight.get('ready'))
         p2_ok=bool(phase2 and phase2.get('steps') and phase2['steps'][-1]['status']=='PASS')
         p3_ok=bool(phase3 and phase3.get('steps') and phase3['steps'][-1]['status'] in ['PASS','WARN'])
-        p4_ok=bool(phase4 and phase4.get('steps') and phase4['steps'][-1]['status'] in ['PASS','WARN'])
+        p4_mode=(phase4 or {}).get('summary',{}).get('mode')
+        p4_real = p4_mode == 'real_backend_parity'
+        p4_status = phase4['steps'][-1]['status'] if phase4 and phase4.get('steps') else None
+        p4_ok=bool(p4_real and p4_status in ['PASS','WARN'])
         add(2,"Check functional + qualification gates","PASS" if pf_ok and p2_ok and p3_ok and p4_ok else "FAIL",
-            "preflight && functional && robustness && parity",
-            f"preflight={pf_ok}; phase2={p2_ok}; phase3={p3_ok}; phase4={p4_ok}",
-            "Confirm the model is compatible, functional, stable enough and behaviorally credible.",
-            "Production should never be judged from benchmark speed alone.",
+            "preflight && functional && robustness && REAL backend parity",
+            f"preflight={pf_ok}; phase2={p2_ok}; phase3={p3_ok}; phase4_real={p4_real}; phase4_pass={p4_ok}",
+            "Confirm the model is compatible, functional, stable enough and validated against a distinct target backend.",
+            "A CPU-only parity dry-run is educational evidence, not accelerator qualification; production must fail closed until real backend parity exists.",
             "Multi-dimensional readiness","Apply same gate chain on B60.","Apply same gate chain on B70.","Different hardware still needs the same logical quality gates.")
         p5s=(phase5 or {}).get('summary',{})
         perf_ok=bool(p5s) and p5s.get('e2e_ms',1e99)<=max_e2e_ms and p5s.get('tokens_per_s',0)>=min_tok_s
@@ -1439,7 +1667,7 @@ def run_phase8_production_qualification(evidence, max_e2e_ms=5000.0, min_tok_s=1
             "Reproducibility / auditability","Capture B60 device/runtime identity.","Capture B70 device/runtime identity.","Device identity and software versions are part of the production artifact.")
         final=complete and pf_ok and p2_ok and p3_ok and p4_ok and perf_ok and p7ok and reproducible
         result['summary']={"ready":final,"preflight":pf_ok,"functional":p2_ok,"qualification":p3_ok,
-            "parity":p4_ok,"performance_slo":perf_ok,"regression":p7ok,"reproducible":reproducible}
+            "parity":p4_ok,"parity_mode":p4_mode,"performance_slo":perf_ok,"regression":p7ok,"reproducible":reproducible}
         result['output']=f"Production qualification={'PASS' if final else 'NOT READY'}"
         add(7,"Apply Phase 8 production verdict","PASS" if final else "FAIL",
             "PASS only if all required evidence gates pass",result['output'],
@@ -1469,7 +1697,7 @@ COMPARISON = [
 st.title("✅ Hugging Face Model Functional Verifier")
 st.write(
     "A lightweight functional checker with a **preflight gate**, a transparent **single-run functional tab**, "
-    "covering the complete lightweight path from preflight through production qualification, with safer memory handling for Streamlit Cloud."
+    "covering the complete lightweight path from preflight through production qualification, with a shared benchmark engine, strict regression baselines, and explicit PASS/WARN/FAIL/SKIPPED semantics."
 )
 
 with st.sidebar:
@@ -1674,12 +1902,20 @@ with tabs[11]:
     p7=st.session_state.get("phase7_result");p8=st.session_state.get("phase8_result")
 
     def stat(result, allow_warn=False):
-        if result is None: return "NOT RUN"
-        if isinstance(result,dict) and "ready" in result: return "PASS" if result.get("ready") else "FAIL"
+        if result is None:
+            return "NOT RUN"
+        if isinstance(result,dict) and "ready" in result:
+            return "PASS" if result.get("ready") else "FAIL"
+        if isinstance(result,dict):
+            mode = result.get("summary",{}).get("mode")
+            if mode == "educational_skip":
+                return "SKIPPED"
         steps=result.get("steps",[]) if isinstance(result,dict) else []
-        if not steps: return "NOT RUN"
+        if not steps:
+            return "NOT RUN"
         s=steps[-1].get("status","UNKNOWN")
-        if allow_warn and s=="WARN": return "WARN"
+        if allow_warn and s=="WARN":
+            return "WARN"
         return s
 
     p5s=(p5 or {}).get("summary",{});p6s=(p6 or {}).get("summary",{});p7s=(p7 or {}).get("summary",{});p8s=(p8 or {}).get("summary",{})
@@ -1687,7 +1923,7 @@ with tabs[11]:
         {"Phase":"0 · Preflight","Implementation gist":"Prove environment/model/device compatibility before expensive work.","Status":"PASS" if pf and pf.get('ready') else "FAIL" if pf else "NOT RUN","Key metrics":"Hard fails; warnings; device visibility; RAM/disk headroom","TPM takeaway":"Environment qualification is a gate, not debugging after the fact.","Top 1% interview question":"Why separate preflight from model validation?","Ideal expected answer":"Preflight isolates setup/runtime compatibility so model failures are not confused with environment failures."},
         {"Phase":"2 · Functional","Implementation gist":"Load tokenizer/model → place tensors → deterministic generation → non-empty output.","Status":stat(p2),"Key metrics":"Load time; generation time; device; dtype; generated tokens","TPM takeaway":"A single PASS only proves basic functionality on this exact stack/backend.","Top 1% interview question":"What does functional verification prove—and not prove?","Ideal expected answer":"It proves the inference path works once; it does not prove stability, parity, performance, or production readiness."},
         {"Phase":"3 · Qualification","Implementation gist":"Repeat runs + prompt variations + long-context sanity.","Status":stat(p3,True),"Key metrics":"Pass rate; deterministic repeatability; average repeat time; memory evidence","TPM takeaway":"One successful run is insufficient; reliability requires repeated and varied evidence.","Top 1% interview question":"Why test repeatability before benchmarking?","Ideal expected answer":"Because unstable execution makes performance numbers untrustworthy and can hide runtime or memory issues."},
-        {"Phase":"4 · Parity","Implementation gist":"CPU reference vs target backend using same prompt/model/settings.","Status":stat(p4,True),"Key metrics":"Text match; top-1 token match; top-5 overlap; max/mean logit difference","TPM takeaway":"Functional does not automatically mean numerically or behaviorally credible.","Top 1% interview question":"Do you require bitwise-identical CPU and GPU outputs?","Ideal expected answer":"Not always; assess deterministic text/token agreement and bounded numeric drift appropriate to precision/backend."},
+        {"Phase":"4 · Parity","Implementation gist":"CPU reference vs DISTINCT target backend using same prompt/model/settings; CPU-only hosted runs are explicitly SKIPPED.","Status":stat(p4,True),"Key metrics":"Parity mode; text match; top-1 token match; top-5 overlap; max/mean logit difference","TPM takeaway":"Functional does not automatically mean numerically or behaviorally credible.","Top 1% interview question":"Do you require bitwise-identical CPU and GPU outputs?","Ideal expected answer":"Not always; assess deterministic text/token agreement and bounded numeric drift appropriate to precision/backend."},
         {"Phase":"5 · Benchmark","Implementation gist":"Warm up → measure prefill → end-to-end → throughput → variability → memory.","Status":stat(p5),"Key metrics":f"Prefill {p5s.get('prefill_ms','—')} ms; TTFT proxy {p5s.get('ttft_proxy_ms','—')} ms; TPOT~ {p5s.get('approx_tpot_ms','—')} ms/tok; E2E {p5s.get('e2e_ms','—')} ms; {p5s.get('tokens_per_s','—')} tok/s","TPM takeaway":"Benchmark only fixed workloads; latency, throughput, variability and capacity all matter.","Top 1% interview question":"Why distinguish prefill from decode in LLM inference?","Ideal expected answer":"Prefill processes prompt tokens largely in parallel; decode is sequential token generation with different bottlenecks and KPIs."},
         {"Phase":"6 · Optimization","Implementation gist":"Measure baseline → apply one controlled tuning change → remeasure → parity check.","Status":stat(p6,True),"Key metrics":f"Speedup {p6s.get('speedup','—')}x; latency gain {p6s.get('latency_improvement_pct','—')}%; throughput gain {p6s.get('throughput_gain_pct','—')}%","TPM takeaway":"Optimization is a measured before/after delta, not a list of knobs.","Top 1% interview question":"How do you prove an optimization really helped?","Ideal expected answer":"Hold workload constant, change one factor, measure repeatably, verify performance gain and preserve functional correctness."},
         {"Phase":"7 · Regression","Implementation gist":"Compare candidate against known-good baseline using thresholds and correctness guard.","Status":stat(p7),"Key metrics":f"Latency Δ {p7s.get('latency_delta_pct','—')}%; throughput Δ {p7s.get('throughput_delta_pct','—')}%; threshold {p7s.get('threshold_pct','—')}%","TPM takeaway":"A baseline turns performance knowledge into an automated release guardrail.","Top 1% interview question":"What makes a regression test valid?","Ideal expected answer":"Same workload/environment, trusted baseline, explicit thresholds, repeatable measurements, and correctness checks."},
@@ -1701,7 +1937,7 @@ with tabs[11]:
     st.markdown("### Readiness dashboard")
     readiness_rows=[r for r in rows if r["Phase"].startswith(("0 ·","2 ·","3 ·","4 ·","5 ·","6 ·","7 ·","8 ·"))]
     phase_names=[r["Phase"] for r in readiness_rows]
-    score_map={"PASS":100,"WARN":60,"FAIL":0,"NOT RUN":0}
+    score_map={"PASS":100,"WARN":60,"SKIPPED":25,"FAIL":0,"NOT RUN":0}
     scores=[score_map.get(r["Status"],0) for r in readiness_rows]
     score_df=pd.DataFrame({"Phase":phase_names,"Readiness":scores}).set_index("Phase")
     st.bar_chart(score_df)
